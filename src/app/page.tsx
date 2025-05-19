@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { searchTokens, TokenInfo } from '@/utils/helius';
-import { MagnifyingGlassIcon, ClipboardIcon, ArrowTopRightOnSquareIcon } from '@heroicons/react/24/outline';
+import { ClipboardIcon, ArrowTopRightOnSquareIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { CheckCircleIcon } from '@heroicons/react/24/solid';
 
 export default function Home() {
@@ -72,39 +72,49 @@ export default function Home() {
         </div>
       </nav>
 
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Search Section */}
-        <div className="mb-8">
-          <div className="max-w-3xl mx-auto text-center mb-8">
-            <h2 className="text-3xl font-bold mb-4 bg-gradient-to-r from-blue-500 to-purple-500 bg-clip-text text-transparent">
-              Find Any Solana Token
-            </h2>
-            <p className="text-gray-400">
-              Search for any token by name or ticker to find its contract address, including newly minted and unindexed tokens
-            </p>
-          </div>
+      <div className="max-w-4xl mx-auto px-4 py-8">
+        <h1 className="text-4xl font-bold text-center text-purple-500 mb-4">Find Any Solana Token</h1>
+        <p className="text-gray-400 text-center mb-8">
+          Search for any token by name, ticker, or contract address to find its details, including newly minted and unindexed tokens
+        </p>
 
-          <form onSubmit={handleSearch} className="max-w-2xl mx-auto">
-            <div className="flex gap-4">
-              <div className="flex-1 relative">
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Enter token name or ticker (e.g., BONK, DUST)"
-                  className="w-full px-4 py-3 rounded-lg bg-[#1E293B] border border-gray-700 text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-                <MagnifyingGlassIcon className="h-5 w-5 absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-500" />
-              </div>
+        <div className="flex gap-4 mb-8">
+          <div className="relative flex-1">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Enter token name, ticker, or paste contract address..."
+              className="w-full px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:outline-none focus:border-purple-500 text-white placeholder-gray-500"
+            />
+            {searchQuery && (
               <button
-                type="submit"
-                disabled={loading}
-                className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-400"
               >
-                {loading ? 'Searching...' : 'Search'}
+                <XMarkIcon className="h-5 w-5" />
               </button>
-            </div>
-          </form>
+            )}
+          </div>
+          <button
+            onClick={handleSearch}
+            disabled={loading || !searchQuery.trim()}
+            className={`px-6 py-3 rounded-lg bg-purple-600 text-white font-semibold hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-gray-900 disabled:opacity-50 disabled:cursor-not-allowed ${
+              loading ? 'cursor-wait' : ''
+            }`}
+          >
+            {loading ? (
+              <div className="flex items-center">
+                <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Searching...
+              </div>
+            ) : (
+              'Search'
+            )}
+          </button>
         </div>
 
         {error && (

@@ -31,6 +31,21 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
 
+    // Check if the query looks like a contract address
+    const isAddressSearch = searchQuery.length >= 32;  // Solana addresses are 32-44 chars
+    
+    if (isAddressSearch) {
+      try {
+        const tokenDetails = await getTokenDetails(query);
+        if (tokenDetails) {
+          results.set(tokenDetails.address, tokenDetails);
+          return Array.from(results.values());
+        }
+      } catch (error) {
+        console.error('Error searching by address:', error);
+      }
+    }
+
     // 1. Search Jupiter's token list (fastest source)
     try {
       const jupiterResponse = await fetch('https://token.jup.ag/all');
@@ -39,7 +54,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       // Filter tokens first to minimize API calls
       const matchingTokens = jupiterTokens.filter((token) => 
         token.symbol.toLowerCase().includes(searchQuery) || 
-        token.name.toLowerCase().includes(searchQuery)
+        token.name.toLowerCase().includes(searchQuery) ||
+        token.address.toLowerCase().includes(searchQuery)  // Also match partial address
       );
 
       // Get creation dates for matching tokens

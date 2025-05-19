@@ -11,6 +11,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,6 +20,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setTokens([]);
+    setHasSearched(true);
 
     try {
       const results = await searchTokens(searchQuery);
@@ -28,6 +30,15 @@ export default function Home() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setSearchQuery(e.target.value);
+    if (hasSearched) {
+      setHasSearched(false);
+      setTokens([]);
+      setError(null);
     }
   };
 
@@ -83,13 +94,18 @@ export default function Home() {
             <input
               type="text"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={handleInputChange}
               placeholder="Enter token name, ticker, or paste contract address..."
               className="w-full px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:outline-none focus:border-purple-500 text-white placeholder-gray-500"
             />
             {searchQuery && (
               <button
-                onClick={() => setSearchQuery('')}
+                onClick={() => {
+                  setSearchQuery('');
+                  setHasSearched(false);
+                  setTokens([]);
+                  setError(null);
+                }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-400"
               >
                 <XMarkIcon className="h-5 w-5" />
@@ -266,7 +282,7 @@ export default function Home() {
           </div>
         )}
 
-        {!loading && tokens.length === 0 && searchQuery && (
+        {!loading && tokens.length === 0 && hasSearched && (
           <div className="text-center py-12">
             <div className="bg-[#1E293B] rounded-lg p-8 max-w-md mx-auto">
               <p className="text-gray-400 mb-2">

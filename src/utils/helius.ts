@@ -260,8 +260,10 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 
                 // Limit cache size
                 if (transactionCache.size > 1000) {
-                  const oldestKey = transactionCache.keys().next().value;
-                  transactionCache.delete(oldestKey);
+                  const firstKey = Array.from(transactionCache.keys())[0];
+                  if (firstKey) {
+                    transactionCache.delete(firstKey);
+                  }
                 }
               }
             }

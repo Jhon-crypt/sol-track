@@ -184,6 +184,17 @@ function findMetadataAddress(mint: PublicKey): PublicKey {
   return publicKey;
 }
 
+// Helper function to sanitize text
+function sanitizeTokenText(text: string): string {
+  // Remove non-printable characters and common garbage patterns
+  const cleaned = text.replace(/[^\x20-\x7E]/g, '')  // Keep only printable ASCII
+                     .replace(/[^\w\s-]/g, '')        // Remove special characters except dash
+                     .trim();
+  
+  // Return "Unknown" if the cleaned text is too short or empty
+  return cleaned.length < 2 ? 'Unknown' : cleaned;
+}
+
 // Optimized token info fetching with metadata
 async function getTokenInfoFromMint(
   mintAddress: string,
@@ -228,17 +239,30 @@ async function getTokenInfoFromMint(
         const uriLength = metadataInfo.data[uriStart];
         const uri = metadataInfo.data.slice(uriStart + 1, uriStart + 1 + uriLength).toString('utf8');
 
-        metadata = { name, symbol, uri };
+        // Sanitize metadata values
+        metadata = {
+          name: sanitizeTokenText(name),
+          symbol: sanitizeTokenText(symbol),
+          uri
+        };
       } catch {
         // Ignore metadata parsing errors
       }
     }
 
     // Use metadata values if available, fallback to mint data
+    const tokenName = metadata?.name || sanitizeTokenText(tokenData.name || '');
+    const tokenSymbol = metadata?.symbol || sanitizeTokenText(tokenData.symbol || '');
+
+    // Skip tokens with invalid names/symbols
+    if (tokenName === 'Unknown' && tokenSymbol === 'Unknown') {
+      return null;
+    }
+
     return {
       address: mintAddress,
-      name: metadata?.name || tokenData.name || 'Unknown',
-      symbol: metadata?.symbol || tokenData.symbol || 'Unknown',
+      name: tokenName,
+      symbol: tokenSymbol,
       source: 'on-chain',
       mintDate,
       isNewToken,

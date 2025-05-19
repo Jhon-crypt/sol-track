@@ -93,82 +93,43 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-// Enhanced token matching to find more related tokens
+// Enhanced token matching to find more relevant tokens
 function matchesTokenQuery(query: string, name: string, symbol: string, address: string): boolean {
   query = query.toLowerCase().trim();
   name = name.toLowerCase().trim();
   symbol = symbol.toLowerCase().trim();
   address = address.toLowerCase().trim();
 
-  // Break query into words for more flexible matching
-  const queryWords = query.split(/[\s_-]+/);
-  const nameWords = name.split(/[\s_-]+/);
-  const symbolWords = symbol.split(/[\s_-]+/);
-
-  // Exact matches first
+  // Direct matches should be prioritized
   if (symbol === query || name === query || address === query) {
     return true;
   }
 
-  // Check if any query word is contained in name or symbol
-  for (const word of queryWords) {
-    if (word.length < 2) continue; // Skip very short words
-    
-    // Check for variations of the word in name and symbol
-    const variations = [
-      word,
-      word + 's',
-      word.replace(/s$/, ''),
-      word + '2',
-      word + '3',
-      word + 'inu',
-      word + 'sol',
-      'sol' + word,
-      word + 'coin',
-      word + 'token',
-    ];
-
-    for (const variation of variations) {
-      if (name.includes(variation) || symbol.includes(variation)) {
-        return true;
-      }
-    }
-
-    // Check each word in name and symbol
-    for (const nameWord of nameWords) {
-      if (nameWord.includes(word) || word.includes(nameWord)) {
-        return true;
-      }
-    }
-    for (const symbolWord of symbolWords) {
-      if (symbolWord.includes(word) || word.includes(symbolWord)) {
-        return true;
-      }
-    }
+  // For short queries (likely tickers), be more strict
+  if (query.length <= 5) {
+    return symbol.includes(query) || 
+           query.includes(symbol) || 
+           name.startsWith(query);
   }
 
-  // Check for common token naming patterns
-  const commonPatterns = [
-    query + 'inu',
-    query + 'sol',
-    'sol' + query,
-    query + 'coin',
-    query + 'token',
-    query + '2',
-    query + '3',
-  ];
+  // For longer queries, check if any word matches exactly
+  const queryWords = query.split(/[\s_-]+/);
+  const nameWords = name.split(/[\s_-]+/);
+  const symbolWords = symbol.split(/[\s_-]+/);
 
-  for (const pattern of commonPatterns) {
-    if (name.includes(pattern) || symbol.includes(pattern)) {
+  // Check for exact word matches
+  for (const word of queryWords) {
+    if (word.length < 2) continue;
+    
+    if (symbolWords.includes(word) || nameWords.includes(word)) {
       return true;
     }
   }
 
-  // Partial matches
+  // Only check for partial matches if no exact matches found
   return symbol.includes(query) || 
-         query.includes(symbol) ||
-         name.includes(query) ||
-         address.includes(query);
+         name.includes(query) || 
+         (query.length > 10 && address.includes(query)); // Only match address for long queries
 }
 
 // Helper function to get metadata address
@@ -210,7 +171,7 @@ async function getTokenInfoFromMint(
       retryWithBackoff(
         () => connection.getAccountInfo(findMetadataAddress(mintPubkey)),
         1
-      ).catch(() => null) // Ignore metadata errors
+      ).catch(() => null)
     ]);
 
     if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
@@ -227,7 +188,6 @@ async function getTokenInfoFromMint(
     let metadata;
     if (metadataInfo?.data) {
       try {
-        // Skip the metadata account discriminator
         const nameLength = metadataInfo.data[4];
         const name = metadataInfo.data.slice(5, 5 + nameLength).toString('utf8');
         
@@ -239,7 +199,6 @@ async function getTokenInfoFromMint(
         const uriLength = metadataInfo.data[uriStart];
         const uri = metadataInfo.data.slice(uriStart + 1, uriStart + 1 + uriLength).toString('utf8');
 
-        // Sanitize metadata values
         metadata = {
           name: sanitizeTokenText(name),
           symbol: sanitizeTokenText(symbol),
@@ -254,8 +213,8 @@ async function getTokenInfoFromMint(
     const tokenName = metadata?.name || sanitizeTokenText(tokenData.name || '');
     const tokenSymbol = metadata?.symbol || sanitizeTokenText(tokenData.symbol || '');
 
-    // Skip tokens with invalid names/symbols
-    if (tokenName === 'Unknown' && tokenSymbol === 'Unknown') {
+    // Skip tokens with invalid or missing names/symbols
+    if (tokenName === 'Unknown' || tokenSymbol === 'Unknown') {
       return null;
     }
 
@@ -270,16 +229,16 @@ async function getTokenInfoFromMint(
       metadata
     };
   } catch {
-    return null; // Skip logging for faster processing
+    return null;
   }
 }
 
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
-    const searchQuery = query.toLowerCase();
+    const searchQuery = query.toLowerCase().trim();
 
-    // First check known tokens in parallel
+    // First check known tokens
     const knownTokenPromises = Object.entries(KNOWN_TOKENS)
       .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
       .map(async ([, tokenData]) => {
@@ -290,39 +249,39 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
         }
       });
 
-    // Wait for known tokens to be processed
     await Promise.all(knownTokenPromises);
 
-    // Get recent signatures
+    // Get recent signatures with more specific parameters
     const recentSignatures = await retryWithBackoff(
       () => connection.getSignaturesForAddress(
         new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: 100 } // Reduced limit for faster initial results
+        { 
+          limit: 100
+        }
       ),
       2
     );
 
     // Process transactions in parallel batches
-    const batchSize = 10; // Increased batch size for parallel processing
+    const batchSize = 10;
     const batches: Array<Promise<void[]>> = [];
     
-    for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
+    for (let i = 0; i < recentSignatures.length && results.size < 50; i += batchSize) {
       const batch = recentSignatures.slice(i, i + batchSize);
       
       const batchPromise = Promise.all(
         batch.map(async (sig) => {
           try {
-            // Check cache first
             let tx = transactionCache.get(sig.signature);
             if (!tx) {
               const parsedTx = await retryWithBackoff(
                 () => connection.getParsedTransaction(sig.signature, {
-                  maxSupportedTransactionVersion: 0
+                  maxSupportedTransactionVersion: 0,
+                  commitment: 'confirmed'
                 }),
                 2
               );
               
-              // Cache the transaction if valid
               if (parsedTx) {
                 tx = {
                   meta: {
@@ -334,7 +293,6 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 };
                 transactionCache.set(sig.signature, tx);
                 
-                // Limit cache size
                 if (transactionCache.size > 1000) {
                   const firstKey = Array.from(transactionCache.keys())[0];
                   if (firstKey) {
@@ -346,16 +304,11 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
             if (!tx?.meta?.postTokenBalances?.length) return;
 
-            // Process mints in parallel
             const mintPromises = tx.meta.postTokenBalances
               .map(balance => balance.mint)
               .filter((mintAddress): mintAddress is string => 
-                // Deduplicate mints and ensure mint address is valid
                 typeof mintAddress === 'string' &&
-                !results.has(mintAddress) &&
-                mintAddress === tx.meta?.postTokenBalances?.find(
-                  b => b.mint === mintAddress
-                )?.mint
+                !results.has(mintAddress)
               )
               .map(async (mintAddress) => {
                 const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
@@ -373,24 +326,28 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
       batches.push(batchPromise);
       
-      // Process batches in parallel but with a small gap
       if (batches.length === 3) {
         await Promise.all(batches);
         batches.length = 0;
-        await delay(300); // Small delay between batch groups
+        await delay(300);
       }
     }
 
-    // Wait for any remaining batches
     if (batches.length > 0) {
       await Promise.all(batches);
     }
 
-    // Sort and return results
+    // Sort results with better prioritization
     const allTokens = Array.from(results.values());
     return allTokens
       .sort((a, b) => {
-        // Known tokens first
+        // Exact matches first
+        const aExactMatch = a.symbol.toLowerCase() === searchQuery || a.name.toLowerCase() === searchQuery;
+        const bExactMatch = b.symbol.toLowerCase() === searchQuery || b.name.toLowerCase() === searchQuery;
+        if (aExactMatch && !bExactMatch) return -1;
+        if (!aExactMatch && bExactMatch) return 1;
+
+        // Then known tokens
         if (a.source === 'known' && b.source !== 'known') return -1;
         if (a.source !== 'known' && b.source === 'known') return 1;
         
@@ -400,7 +357,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
         if (!b.mintDate) return -1;
         return b.mintDate.getTime() - a.mintDate.getTime();
       })
-      .slice(0, 100);
+      .slice(0, 50); // Limit results for better relevance
 
   } catch (error) {
     console.error('Error in searchTokens:', error);

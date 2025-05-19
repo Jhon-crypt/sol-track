@@ -233,12 +233,84 @@ async function getTokenInfoFromMint(
   }
 }
 
+// Interface for Helius DAS response
+interface DigitalAsset {
+  id: string;
+  content: {
+    metadata: {
+      name: string;
+      symbol: string;
+    };
+  };
+  token_info: {
+    supply: string;
+  };
+  created_at: string;
+}
+
+// Fast token lookup using Helius DAS API
+async function searchTokensBySymbol(query: string): Promise<TokenInfo[]> {
+  try {
+    const response = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: {
+          symbol: query.toUpperCase()
+        },
+        options: {
+          limit: 10
+        }
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch from Helius DAS API');
+    }
+
+    const assets: DigitalAsset[] = await response.json();
+    return assets.map(asset => ({
+      address: asset.id,
+      name: asset.content.metadata.name,
+      symbol: asset.content.metadata.symbol,
+      source: 'helius-das',
+      isNewToken: false, // We'll update this later if needed
+      supply: asset.token_info.supply,
+      mintDate: new Date(asset.created_at)
+    }));
+  } catch (error) {
+    console.error('Error searching tokens by symbol:', error);
+    return [];
+  }
+}
+
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase().trim();
 
-    // First check known tokens
+    // First try direct symbol lookup for exact matches
+    if (query.length <= 10) { // Only for reasonable ticker lengths
+      const dasResults = await searchTokensBySymbol(query);
+      for (const token of dasResults) {
+        results.set(token.address, token);
+      }
+
+      // If we found exact matches, return them immediately
+      if (results.size > 0) {
+        return Array.from(results.values())
+          .sort((a, b) => {
+            // Exact symbol matches first
+            const aExactMatch = a.symbol.toLowerCase() === searchQuery;
+            const bExactMatch = b.symbol.toLowerCase() === searchQuery;
+            if (aExactMatch && !bExactMatch) return -1;
+            if (!aExactMatch && bExactMatch) return 1;
+            return 0;
+          });
+      }
+    }
+
+    // If no direct matches found, check known tokens
     const knownTokenPromises = Object.entries(KNOWN_TOKENS)
       .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
       .map(async ([, tokenData]) => {
@@ -251,93 +323,93 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
     await Promise.all(knownTokenPromises);
 
-    // Get recent signatures with more specific parameters
-    const recentSignatures = await retryWithBackoff(
-      () => connection.getSignaturesForAddress(
-        new PublicKey(TOKEN_PROGRAM_ID),
-        { 
-          limit: 100
-        }
-      ),
-      2
-    );
+    // Only if still no results, search recent transactions
+    if (results.size === 0) {
+      const recentSignatures = await retryWithBackoff(
+        () => connection.getSignaturesForAddress(
+          new PublicKey(TOKEN_PROGRAM_ID),
+          { limit: 100 }
+        ),
+        2
+      );
 
-    // Process transactions in parallel batches
-    const batchSize = 10;
-    const batches: Array<Promise<void[]>> = [];
-    
-    for (let i = 0; i < recentSignatures.length && results.size < 50; i += batchSize) {
-      const batch = recentSignatures.slice(i, i + batchSize);
+      // Process transactions in parallel batches
+      const batchSize = 10;
+      const batches: Array<Promise<void[]>> = [];
       
-      const batchPromise = Promise.all(
-        batch.map(async (sig) => {
-          try {
-            let tx = transactionCache.get(sig.signature);
-            if (!tx) {
-              const parsedTx = await retryWithBackoff(
-                () => connection.getParsedTransaction(sig.signature, {
-                  maxSupportedTransactionVersion: 0,
-                  commitment: 'confirmed'
-                }),
-                2
-              );
-              
-              if (parsedTx) {
-                tx = {
-                  meta: {
-                    postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
-                      mint: balance.mint
-                    }))
-                  },
-                  blockTime: parsedTx.blockTime
-                };
-                transactionCache.set(sig.signature, tx);
+      for (let i = 0; i < recentSignatures.length && results.size < 50; i += batchSize) {
+        const batch = recentSignatures.slice(i, i + batchSize);
+        
+        const batchPromise = Promise.all(
+          batch.map(async (sig) => {
+            try {
+              let tx = transactionCache.get(sig.signature);
+              if (!tx) {
+                const parsedTx = await retryWithBackoff(
+                  () => connection.getParsedTransaction(sig.signature, {
+                    maxSupportedTransactionVersion: 0,
+                    commitment: 'confirmed'
+                  }),
+                  2
+                );
                 
-                if (transactionCache.size > 1000) {
-                  const firstKey = Array.from(transactionCache.keys())[0];
-                  if (firstKey) {
-                    transactionCache.delete(firstKey);
+                if (parsedTx) {
+                  tx = {
+                    meta: {
+                      postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
+                        mint: balance.mint
+                      }))
+                    },
+                    blockTime: parsedTx.blockTime
+                  };
+                  transactionCache.set(sig.signature, tx);
+                  
+                  if (transactionCache.size > 1000) {
+                    const firstKey = Array.from(transactionCache.keys())[0];
+                    if (firstKey) {
+                      transactionCache.delete(firstKey);
+                    }
                   }
                 }
               }
+
+              if (!tx?.meta?.postTokenBalances?.length) return;
+
+              const mintPromises = tx.meta.postTokenBalances
+                .map(balance => balance.mint)
+                .filter((mintAddress): mintAddress is string => 
+                  typeof mintAddress === 'string' &&
+                  !results.has(mintAddress)
+                )
+                .map(async (mintAddress) => {
+                  const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
+                  if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
+                    results.set(mintAddress, tokenInfo);
+                  }
+                });
+
+              await Promise.all(mintPromises);
+            } catch {
+              // Skip error logging for faster processing
             }
+          })
+        );
 
-            if (!tx?.meta?.postTokenBalances?.length) return;
+        batches.push(batchPromise);
+        
+        if (batches.length === 3) {
+          await Promise.all(batches);
+          batches.length = 0;
+          await delay(300);
+        }
+      }
 
-            const mintPromises = tx.meta.postTokenBalances
-              .map(balance => balance.mint)
-              .filter((mintAddress): mintAddress is string => 
-                typeof mintAddress === 'string' &&
-                !results.has(mintAddress)
-              )
-              .map(async (mintAddress) => {
-                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
-                if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
-                  results.set(mintAddress, tokenInfo);
-                }
-              });
-
-            await Promise.all(mintPromises);
-          } catch {
-            // Skip error logging for faster processing
-          }
-        })
-      );
-
-      batches.push(batchPromise);
-      
-      if (batches.length === 3) {
+      if (batches.length > 0) {
         await Promise.all(batches);
-        batches.length = 0;
-        await delay(300);
       }
     }
 
-    if (batches.length > 0) {
-      await Promise.all(batches);
-    }
-
-    // Sort results with better prioritization
+    // Sort and return results
     const allTokens = Array.from(results.values());
     return allTokens
       .sort((a, b) => {
@@ -357,7 +429,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
         if (!b.mintDate) return -1;
         return b.mintDate.getTime() - a.mintDate.getTime();
       })
-      .slice(0, 50); // Limit results for better relevance
+      .slice(0, 50);
 
   } catch (error) {
     console.error('Error in searchTokens:', error);

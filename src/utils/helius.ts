@@ -43,6 +43,7 @@ if (!HELIUS_API_KEY) {
 
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
   commitment: 'confirmed',
+  wsEndpoint: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
 });
 
 // Cache for recent transactions to avoid re-fetching
@@ -70,18 +71,29 @@ async function retryWithBackoff<T>(
   
   for (let i = 0; i <= retries; i++) {
     try {
-      return await fn();
+      const result = await fn();
+      // Check if result is null or undefined
+      if (result === null || result === undefined) {
+        throw new Error('Empty result from RPC');
+      }
+      return result;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      console.error(`Attempt ${i + 1}/${retries + 1} failed:`, lastError.message);
       
-      // Only add significant delay for rate limit errors
-      if (lastError.message.includes('rate limit')) {
+      // Check for specific error types
+      const errorMessage = lastError.message.toLowerCase();
+      if (errorMessage.includes('rate limit') || errorMessage.includes('429')) {
         const jitter = Math.random() * 200;
-        const delayMs = baseDelay * Math.pow(1.5, i) + jitter;
+        const delayMs = baseDelay * Math.pow(2, i) + jitter;
+        console.log(`Rate limit hit, waiting ${delayMs}ms`);
         await delay(delayMs);
+      } else if (errorMessage.includes('timeout') || errorMessage.includes('failed to fetch')) {
+        // Network issues - wait a bit longer
+        await delay(1000);
       } else {
-        // Minimal delay for other errors
-        await delay(100);
+        // Other errors - shorter delay
+        await delay(200);
       }
       
       if (i === retries) {
@@ -293,6 +305,7 @@ function getTimeRangeInMs(range: TimeRange): number {
 
 export async function searchTokens(query: string, timeRange: TimeRange = '24h'): Promise<TokenInfo[]> {
   try {
+    console.log('Starting token search for:', query, 'timeRange:', timeRange);
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
     const timeRangeMs = getTimeRangeInMs(timeRange);
@@ -302,31 +315,41 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     const knownTokenPromises = Object.entries(KNOWN_TOKENS)
       .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
       .map(async ([, tokenData]) => {
-        const tokenInfo = await getTokenInfoFromMint(tokenData.address);
-        if (tokenInfo) {
-          tokenInfo.source = 'known';
-          results.set(tokenData.address, tokenInfo);
+        try {
+          console.log('Checking known token:', tokenData.name);
+          const tokenInfo = await getTokenInfoFromMint(tokenData.address);
+          if (tokenInfo) {
+            console.log('Found known token:', tokenInfo.name);
+            tokenInfo.source = 'known';
+            results.set(tokenData.address, tokenInfo);
+          }
+        } catch (error) {
+          console.error('Error processing known token:', tokenData.name, error);
         }
       });
 
     // Wait for known tokens to be processed
     await Promise.all(knownTokenPromises);
+    console.log('Known tokens processed, found:', results.size);
 
     // Get recent signatures with increased limit for historical search
+    console.log('Fetching recent signatures...');
     const recentSignatures = await retryWithBackoff(
       () => connection.getSignaturesForAddress(
         new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: timeRange === 'all' ? 1000 : 500 } // Increased limit for historical search
+        { limit: timeRange === 'all' ? 1000 : 500 }
       ),
-      2
+      3
     );
+    console.log('Found signatures:', recentSignatures.length);
 
-    // Process transactions in parallel batches
-    const batchSize = 10;
+    // Process transactions in smaller batches
+    const batchSize = 5; // Reduced batch size
     const batches: Array<Promise<void[]>> = [];
     
     for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
       const batch = recentSignatures.slice(i, i + batchSize);
+      console.log(`Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(recentSignatures.length/batchSize)}`);
       
       const batchPromise = Promise.all(
         batch.map(async (sig) => {
@@ -341,72 +364,81 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
                 2
               );
               
+              if (!parsedTx) {
+                console.log('No transaction data for signature:', sig.signature);
+                return;
+              }
+              
               // Cache the transaction if valid
-              if (parsedTx) {
-                tx = {
-                  meta: {
-                    postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
-                      mint: balance.mint
-                    }))
-                  },
-                  blockTime: parsedTx.blockTime
-                };
-                transactionCache.set(sig.signature, tx);
-                
-                // Limit cache size
-                if (transactionCache.size > 1000) {
-                  const firstKey = Array.from(transactionCache.keys())[0];
-                  if (firstKey) {
-                    transactionCache.delete(firstKey);
-                  }
+              tx = {
+                meta: {
+                  postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
+                    mint: balance.mint
+                  }))
+                },
+                blockTime: parsedTx.blockTime
+              };
+              transactionCache.set(sig.signature, tx);
+              
+              // Limit cache size
+              if (transactionCache.size > 1000) {
+                const firstKey = Array.from(transactionCache.keys())[0];
+                if (firstKey) {
+                  transactionCache.delete(firstKey);
                 }
               }
             }
 
-            if (!tx?.meta?.postTokenBalances?.length) return;
+            if (!tx?.meta?.postTokenBalances?.length) {
+              console.log('No token balances in transaction');
+              return;
+            }
 
             // Check if transaction is within time range
             if (tx.blockTime && timeRange !== 'all') {
               const txTime = tx.blockTime * 1000;
-              if (currentTime - txTime > timeRangeMs) return;
+              if (currentTime - txTime > timeRangeMs) {
+                console.log('Transaction outside time range');
+                return;
+              }
             }
 
             // Process mints in parallel
             const mintPromises = tx.meta.postTokenBalances
               .map(balance => balance.mint)
               .filter((mintAddress): mintAddress is string => 
-                // Deduplicate mints and ensure mint address is valid
                 typeof mintAddress === 'string' &&
-                !results.has(mintAddress) &&
-                mintAddress === tx.meta?.postTokenBalances?.find(
-                  b => b.mint === mintAddress
-                )?.mint
+                !results.has(mintAddress)
               )
               .map(async (mintAddress) => {
-                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
-                if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
-                  // Update isNewToken based on selected time range
-                  if (tokenInfo.mintDate) {
-                    tokenInfo.isNewToken = currentTime - tokenInfo.mintDate.getTime() <= timeRangeMs;
+                try {
+                  const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
+                  if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
+                    console.log('Found matching token:', tokenInfo.name);
+                    if (tokenInfo.mintDate) {
+                      tokenInfo.isNewToken = currentTime - tokenInfo.mintDate.getTime() <= timeRangeMs;
+                    }
+                    results.set(mintAddress, tokenInfo);
                   }
-                  results.set(mintAddress, tokenInfo);
+                } catch (error) {
+                  console.error('Error processing mint:', mintAddress, error);
                 }
               });
 
             await Promise.all(mintPromises);
-          } catch {
-            // Skip error logging for faster processing
+          } catch (error) {
+            console.error('Error processing transaction:', sig.signature, error);
           }
         })
       );
 
       batches.push(batchPromise);
       
-      // Process batches in parallel but with a small gap
-      if (batches.length === 3) {
+      // Process fewer batches in parallel and increase delay
+      if (batches.length === 2) {
         await Promise.all(batches);
         batches.length = 0;
-        await delay(300); // Small delay between batch groups
+        await delay(500); // Increased delay between batch groups
       }
     }
 
@@ -414,6 +446,8 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     if (batches.length > 0) {
       await Promise.all(batches);
     }
+
+    console.log('Search completed, total results:', results.size);
 
     // Sort and return results
     const allTokens = Array.from(results.values());

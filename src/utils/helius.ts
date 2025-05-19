@@ -1,6 +1,9 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
+// Metadata program ID
+const METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
+
 // Base interface for token data
 interface BaseToken {
   address: string;
@@ -10,6 +13,11 @@ interface BaseToken {
   isNewToken?: boolean;
   supply?: string;
   holders?: number;
+  metadata?: {
+    name: string;
+    symbol: string;
+    uri?: string;
+  };
 }
 
 // Main token info interface used throughout the app
@@ -163,16 +171,36 @@ function matchesTokenQuery(query: string, name: string, symbol: string, address:
          address.includes(query);
 }
 
-// Optimized token info fetching
+// Helper function to get metadata address
+function findMetadataAddress(mint: PublicKey): PublicKey {
+  const [publicKey] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from('metadata'),
+      METADATA_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+    ],
+    METADATA_PROGRAM_ID
+  );
+  return publicKey;
+}
+
+// Optimized token info fetching with metadata
 async function getTokenInfoFromMint(
   mintAddress: string,
   blockTime?: number | null
 ): Promise<TokenInfo | null> {
   try {
-    const tokenInfo = await retryWithBackoff(
-      () => connection.getParsedAccountInfo(new PublicKey(mintAddress)),
-      2 // Reduced retries for faster response
-    );
+    const mintPubkey = new PublicKey(mintAddress);
+    const [tokenInfo, metadataInfo] = await Promise.all([
+      retryWithBackoff(
+        () => connection.getParsedAccountInfo(mintPubkey),
+        2
+      ),
+      retryWithBackoff(
+        () => connection.getAccountInfo(findMetadataAddress(mintPubkey)),
+        1
+      ).catch(() => null) // Ignore metadata errors
+    ]);
 
     if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
 
@@ -184,14 +212,38 @@ async function getTokenInfoFromMint(
     const mintDate = blockTime ? new Date(blockTime * 1000) : undefined;
     const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= 24 * 60 * 60 * 1000) : false;
 
+    // Try to decode metadata if available
+    let metadata;
+    if (metadataInfo?.data) {
+      try {
+        // Skip the metadata account discriminator
+        const nameLength = metadataInfo.data[4];
+        const name = metadataInfo.data.slice(5, 5 + nameLength).toString('utf8');
+        
+        const symbolStart = 5 + nameLength;
+        const symbolLength = metadataInfo.data[symbolStart];
+        const symbol = metadataInfo.data.slice(symbolStart + 1, symbolStart + 1 + symbolLength).toString('utf8');
+        
+        const uriStart = symbolStart + 1 + symbolLength;
+        const uriLength = metadataInfo.data[uriStart];
+        const uri = metadataInfo.data.slice(uriStart + 1, uriStart + 1 + uriLength).toString('utf8');
+
+        metadata = { name, symbol, uri };
+      } catch {
+        // Ignore metadata parsing errors
+      }
+    }
+
+    // Use metadata values if available, fallback to mint data
     return {
       address: mintAddress,
-      name: tokenData.name || 'Unknown',
-      symbol: tokenData.symbol || 'Unknown',
+      name: metadata?.name || tokenData.name || 'Unknown',
+      symbol: metadata?.symbol || tokenData.symbol || 'Unknown',
       source: 'on-chain',
       mintDate,
       isNewToken,
-      supply: tokenData.supply || '0'
+      supply: tokenData.supply || '0',
+      metadata
     };
   } catch {
     return null; // Skip logging for faster processing

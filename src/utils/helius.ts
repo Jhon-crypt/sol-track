@@ -55,19 +55,6 @@ interface HeliusTokenMetadata {
   };
 }
 
-// Interface for Helius DAS search response
-interface HeliusSearchResponse {
-  items: Array<{
-    token: {
-      mint: string;
-      name: string;
-      symbol: string;
-      supply?: string;
-      uri?: string;
-    };
-  }>;
-}
-
 // Helper function for Helius API calls
 async function fetchHelius<T>(endpoint: string, data?: unknown): Promise<T> {
   const url = `${HELIUS_URL}${endpoint}?api-key=${HELIUS_API_KEY}`;
@@ -213,25 +200,16 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     const timeRangeMs = getTimeRangeInMs(timeRange);
     const currentTime = new Date().getTime();
 
-    // Search for tokens using Helius DAS API
+    // Search for tokens using Helius API
     try {
-      const searchResults = await fetchHelius<HeliusSearchResponse>('/das/search', {
+      const searchResults = await fetchHelius<HeliusTokenMetadata[]>('/v0/token-metadata/search', {
         query: searchQuery,
         limit: 100,
-        displayOptions: {
-          showNativeBalance: false,
-          showTokenMetadata: true,
-          showUnknownTokens: true,
-        },
-        ownerAddress: null,
-        nftCollectionFilter: null,
-        tokenType: "fungible",
       });
 
-      if (searchResults?.items) {
-        for (const item of searchResults.items) {
-          const token = item.token;
-          if (!token || results.has(token.mint)) continue;
+      if (Array.isArray(searchResults)) {
+        for (const token of searchResults) {
+          if (!token.mint || results.has(token.mint)) continue;
 
           try {
             // Get mint date if available
@@ -248,18 +226,21 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
               console.error('Error fetching mint date:', error);
             }
 
+            const metadata = token.onChainMetadata;
+            const offChainMetadata = token.offChainMetadata;
+
             const tokenInfo: TokenInfo = {
               address: token.mint,
-              name: token.name || 'Unknown',
-              symbol: token.symbol || 'Unknown',
+              name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+              symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
               source: 'on-chain',
               isNewToken: mintDate ? (currentTime - mintDate.getTime() <= timeRangeMs) : false,
               mintDate,
-              supply: token.supply?.toString() || '0',
+              supply: metadata?.tokenInfo?.supply?.toString() || '0',
               metadata: {
-                name: token.name || 'Unknown',
-                symbol: token.symbol || 'Unknown',
-                uri: token.uri
+                name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+                symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
+                uri: metadata?.metadata?.uri
               }
             };
 

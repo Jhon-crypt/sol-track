@@ -149,10 +149,10 @@ export default function Home() {
                           <div>
                             <h3 className="text-lg font-medium">{token.name}</h3>
                             <p className="text-blue-400 font-mono">{token.symbol}</p>
-                            {token.createdAt && (
+                            {token.mintDate && (
                               <p className="text-xs text-green-400 mt-1">
-                                Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
-                                {new Date(token.createdAt).toLocaleTimeString()}
+                                Minted: {new Date(token.mintDate).toLocaleDateString()} at{' '}
+                                {new Date(token.mintDate).toLocaleTimeString()}
                               </p>
                             )}
                           </div>
@@ -213,10 +213,10 @@ export default function Home() {
                           <div>
                             <h3 className="text-lg font-medium">{token.name}</h3>
                             <p className="text-blue-400 font-mono">{token.symbol}</p>
-                            {token.createdAt && (
-                              <p className="text-xs text-gray-400 mt-1">
-                                Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
-                                {new Date(token.createdAt).toLocaleTimeString()}
+                            {token.mintDate && (
+                              <p className="text-xs text-green-400 mt-1">
+                                Minted: {new Date(token.mintDate).toLocaleDateString()} at{' '}
+                                {new Date(token.mintDate).toLocaleTimeString()}
                               </p>
                             )}
                           </div>
@@ -224,8 +224,8 @@ export default function Home() {
                             <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
                               {token.source}
                             </span>
-                            {!token.createdAt && (
-                              <span className="text-xs text-gray-500">Creation date unknown</span>
+                            {!token.mintDate && (
+                              <span className="text-xs text-gray-500">Mint date unknown</span>
                             )}
                           </div>
                         </div>

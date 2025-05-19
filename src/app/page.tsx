@@ -1,50 +1,45 @@
 'use client';
 
 import { useState } from 'react';
-import { searchTokens, TokenInfo, TimeRange } from '@/utils/helius';
+import { searchTokens, TokenInfo } from '@/utils/helius';
 import { ClipboardIcon, ArrowTopRightOnSquareIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { CheckCircleIcon } from '@heroicons/react/24/solid';
 
 export default function Home() {
   const [searchQuery, setSearchQuery] = useState('');
-  const [timeRange, setTimeRange] = useState<TimeRange>('all');
-  const [results, setResults] = useState<TokenInfo[]>([]);
+  const [tokens, setTokens] = useState<TokenInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
 
-  const handleSearch = async (e?: React.FormEvent) => {
-    e?.preventDefault();
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!searchQuery.trim()) return;
 
     setLoading(true);
     setError(null);
+    setTokens([]);
+
     try {
-      const searchResults = await searchTokens(searchQuery.trim(), { timeRange });
-      setResults(searchResults);
-      if (searchResults.length === 0) {
-        setError(`No tokens found matching "${searchQuery}"`);
-      }
+      const results = await searchTokens(searchQuery);
+      setTokens(results);
     } catch (err) {
-      console.error('Search error:', err);
       setError('Failed to search tokens. Please try again.');
+      console.error(err);
     } finally {
       setLoading(false);
     }
   };
 
-  const copyToClipboard = (address: string) => {
-    navigator.clipboard.writeText(address);
-    setCopiedAddress(address);
-    setTimeout(() => setCopiedAddress(null), 2000);
+  const copyToClipboard = async (address: string) => {
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopiedAddress(address);
+      setTimeout(() => setCopiedAddress(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
   };
-
-  const timeRangeOptions: { value: TimeRange; label: string }[] = [
-    { value: 'all', label: 'All Time' },
-    { value: '1d', label: 'Past 24 Hours' },
-    { value: '7d', label: 'Past 7 Days' },
-    { value: '30d', label: 'Past 30 Days' },
-  ];
 
   return (
     <main className="min-h-screen bg-[#0F172A] text-white">
@@ -101,17 +96,6 @@ export default function Home() {
               </button>
             )}
           </div>
-          <select
-            value={timeRange}
-            onChange={(e) => setTimeRange(e.target.value as TimeRange)}
-            className="px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:outline-none focus:border-purple-500 text-white"
-          >
-            {timeRangeOptions.map(option => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
           <button
             onClick={handleSearch}
             disabled={loading || !searchQuery.trim()}
@@ -142,11 +126,11 @@ export default function Home() {
         )}
 
         {/* Results Section */}
-        {results.length > 0 && (
+        {tokens.length > 0 && (
           <div className="space-y-4">
             <h3 className="text-xl font-semibold mb-4">Search Results</h3>
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {results.map((token) => (
+              {tokens.map((token) => (
                 <div
                   key={token.address}
                   className="p-4 rounded-lg bg-[#1E293B] border border-gray-800 hover:border-gray-700 transition-colors duration-200"
@@ -155,10 +139,21 @@ export default function Home() {
                     <div>
                       <h3 className="text-lg font-medium">{token.name}</h3>
                       <p className="text-blue-400 font-mono">{token.symbol}</p>
+                      {token.createdAt && (
+                        <p className="text-xs text-gray-400 mt-1">
+                          Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
+                          {new Date(token.createdAt).toLocaleTimeString()}
+                        </p>
+                      )}
                     </div>
-                    <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
-                      {token.source}
-                    </span>
+                    <div className="flex flex-col items-end gap-2">
+                      <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
+                        {token.source}
+                      </span>
+                      {!token.createdAt && (
+                        <span className="text-xs text-gray-500">Creation date unknown</span>
+                      )}
+                    </div>
                   </div>
                   
                   <div className="space-y-2">
@@ -188,14 +183,6 @@ export default function Home() {
                     <p className="font-mono text-sm text-gray-300 break-all">
                       {token.address}
                     </p>
-                    {token.createdAt && (
-                      <div className="mt-3 flex items-center justify-between">
-                        <span className="text-sm text-gray-400">Created:</span>
-                        <span className="text-sm text-gray-300">
-                          {new Date(token.createdAt).toLocaleDateString()} {new Date(token.createdAt).toLocaleTimeString()}
-                        </span>
-                      </div>
-                    )}
                   </div>
                 </div>
               ))}
@@ -203,7 +190,7 @@ export default function Home() {
           </div>
         )}
 
-        {!loading && results.length === 0 && searchQuery && (
+        {!loading && tokens.length === 0 && searchQuery && (
           <div className="text-center py-12">
             <div className="bg-[#1E293B] rounded-lg p-8 max-w-md mx-auto">
               <p className="text-gray-400 mb-2">

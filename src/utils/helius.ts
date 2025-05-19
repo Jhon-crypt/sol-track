@@ -1,102 +1,98 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
-export interface TokenInfo {
+// Base interface for token data
+interface BaseToken {
   address: string;
   name: string;
   symbol: string;
-  source: string;
   createdAt?: Date;
 }
 
-export interface JupiterToken {
+// Jupiter API response interface
+interface JupiterToken extends BaseToken {
   address: string;
-  chainId: number;
-  decimals: number;
-  name: string;
   symbol: string;
-  logoURI?: string;
-  tags?: string[];
+  name: string;
 }
 
-export type TimeRange = '1d' | '7d' | '30d' | 'all';
-
-interface SearchOptions {
-  timeRange?: TimeRange;
-  limit?: number;
+// Interface for tokens found through on-chain data
+interface OnChainToken extends BaseToken {
+  source: 'on-chain';
 }
 
-const DEFAULT_SEARCH_OPTIONS: SearchOptions = {
-  timeRange: 'all',
-  limit: 100
-};
-
-// Helper function to get the timestamp for a time range
-function getStartTimestamp(timeRange: TimeRange): number | null {
-  if (timeRange === 'all') return null;
-  
-  const now = Date.now();
-  const days = {
-    '1d': 1,
-    '7d': 7,
-    '30d': 30
-  }[timeRange];
-  
-  return Math.floor((now - days * 24 * 60 * 60 * 1000) / 1000); // Convert to seconds
+// Main token info interface used throughout the app
+export interface TokenInfo extends BaseToken {
+  source: string;  // 'jupiter' | 'on-chain'
 }
 
-const connection = new Connection(process.env.NEXT_PUBLIC_RPC_URL || 'https://api.mainnet-beta.solana.com');
+// RPC endpoint for direct Solana connection
+const connection = new Connection('https://api.mainnet-beta.solana.com');
 
-export async function searchTokens(query: string, options: SearchOptions = DEFAULT_SEARCH_OPTIONS): Promise<TokenInfo[]> {
+export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
-    const searchQuery = query.toLowerCase().trim();
-    const startTime = getStartTimestamp(options.timeRange || 'all');
+    const searchQuery = query.toLowerCase();
 
-    // First try Jupiter's token list (fastest source)
+    // Check if the query looks like a contract address
+    const isAddressSearch = searchQuery.length >= 32;  // Solana addresses are 32-44 chars
+    
+    if (isAddressSearch) {
+      try {
+        const tokenDetails = await getTokenDetails(query);
+        if (tokenDetails) {
+          results.set(tokenDetails.address, tokenDetails);
+          return Array.from(results.values());
+        }
+      } catch (error) {
+        console.error('Error searching by address:', error);
+      }
+    }
+
+    // 1. Search Jupiter's token list (fastest source)
     try {
-      console.log('Fetching from Jupiter...');
       const jupiterResponse = await fetch('https://token.jup.ag/all');
       const jupiterTokens: JupiterToken[] = await jupiterResponse.json();
       
-      // Filter tokens that match the search query
+      // Filter tokens first to minimize API calls
       const matchingTokens = jupiterTokens.filter((token) => 
         token.symbol.toLowerCase().includes(searchQuery) || 
         token.name.toLowerCase().includes(searchQuery) ||
-        token.address.toLowerCase() === searchQuery
+        token.address.toLowerCase().includes(searchQuery)  // Also match partial address
       );
 
-      console.log(`Found ${matchingTokens.length} matching tokens in Jupiter`);
+      // Get creation dates for matching tokens
+      await Promise.all(
+        matchingTokens.map(async (token) => {
+          try {
+            // Get recent signatures for the token's mint address
+            const signatures = await connection.getSignaturesForAddress(
+              new PublicKey(token.address),
+              { limit: 1 }  // Get only the earliest transaction
+            );
 
-      // Process matching tokens
-      for (const token of matchingTokens) {
-        try {
-          // Get creation date
-          const signatures = await connection.getSignaturesForAddress(
-            new PublicKey(token.address),
-            { limit: 1 }
-          );
+            if (signatures.length > 0) {
+              const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
+              const createdAt = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
 
-          let createdAt: Date | undefined;
-          if (signatures.length > 0) {
-            const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
-            createdAt = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
-          }
-
-          // Only add if within time range
-          if (!startTime || (createdAt && createdAt.getTime() / 1000 >= startTime)) {
-            results.set(token.address, {
-              address: token.address,
-              name: token.name,
-              symbol: token.symbol,
-              source: 'jupiter',
-              createdAt
-            });
-          }
-        } catch (error) {
-          console.error('Error processing Jupiter token:', error);
-          // Add token without creation date if no time filter
-          if (!startTime) {
+              results.set(token.address, {
+                address: token.address,
+                name: token.name,
+                symbol: token.symbol,
+                source: 'jupiter',
+                createdAt
+              });
+            } else {
+              results.set(token.address, {
+                address: token.address,
+                name: token.name,
+                symbol: token.symbol,
+                source: 'jupiter'
+              });
+            }
+          } catch (error) {
+            console.error('Error fetching token creation date:', error);
+            // Still add the token even if we can't get its creation date
             results.set(token.address, {
               address: token.address,
               name: token.name,
@@ -104,88 +100,72 @@ export async function searchTokens(query: string, options: SearchOptions = DEFAU
               source: 'jupiter'
             });
           }
-        }
-      }
+        })
+      );
     } catch (error) {
       console.error('Error fetching from Jupiter:', error);
     }
 
-    // If it looks like a contract address and we haven't found it yet, try direct lookup
-    if (searchQuery.length >= 32 && searchQuery.length <= 44) {
-      try {
-        console.log('Trying direct token lookup...');
-        const tokenDetails = await getTokenDetails(searchQuery);
-        if (tokenDetails) {
-          if (!startTime || (tokenDetails.createdAt && tokenDetails.createdAt.getTime() / 1000 >= startTime)) {
-            results.set(tokenDetails.address, tokenDetails);
-          }
-        }
-      } catch (error) {
-        console.error('Error in direct token lookup:', error);
-      }
-    }
+    // 2. Search recent token mints (for new tokens)
+    try {
+      const recentSignatures = await connection.getSignaturesForAddress(
+        new PublicKey(TOKEN_PROGRAM_ID),
+        { limit: 100 }
+      );
 
-    // If we still haven't found anything or if searching by name/symbol, check recent mints
-    if (results.size === 0 || searchQuery.length < 32) {
-      try {
-        console.log('Searching recent mints...');
-        const searchLimit = options.limit || 100;
-        const recentSignatures = await connection.getSignaturesForAddress(
-          new PublicKey(TOKEN_PROGRAM_ID),
-          { 
-            limit: searchLimit,
-            ...(startTime ? { until: startTime.toString() } : {})
-          }
-        );
-
-        for (const sig of recentSignatures) {
+      const mintAddresses = await Promise.all(
+        recentSignatures.map(async (sig) => {
           try {
             const tx = await connection.getTransaction(sig.signature);
-            if (!tx?.meta?.postTokenBalances?.length) continue;
+            if (!tx?.meta?.postTokenBalances?.length) return null;
             
+            // Get the mint address and timestamp from the transaction
             const mintAddress = tx.meta.postTokenBalances[0].mint;
             const createdAt = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
             
-            // Skip if outside time range
-            if (startTime && (!createdAt || createdAt.getTime() / 1000 < startTime)) {
-              continue;
-            }
-
-            // Skip if we already have this token
-            if (results.has(mintAddress)) continue;
-
             const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
-            if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
+            
+            if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
             
             const data = tokenInfo.value.data;
             if ('parsed' in data && data.parsed.type === 'mint') {
               const tokenData = data.parsed.info;
-              const name = tokenData.name || 'Unknown';
-              const symbol = tokenData.symbol || 'Unknown';
-              
-              if (name.toLowerCase().includes(searchQuery) || 
-                  symbol.toLowerCase().includes(searchQuery) ||
-                  mintAddress.toLowerCase() === searchQuery) {
-                results.set(mintAddress, {
-                  address: mintAddress,
-                  name,
-                  symbol,
-                  source: 'on-chain',
-                  createdAt
-                });
-              }
+              const mint: OnChainToken = {
+                address: mintAddress,
+                name: tokenData.name || 'Unknown',
+                symbol: tokenData.symbol || 'Unknown',
+                source: 'on-chain',
+                createdAt
+              };
+              return mint;
             }
+            return null;
           } catch (error) {
-            console.error('Error processing mint:', error);
+            console.error('Error processing transaction:', error);
+            return null;
           }
-        }
-      } catch (error) {
-        console.error('Error searching recent mints:', error);
-      }
+        })
+      );
+
+      // Add valid mint addresses to results
+      mintAddresses
+        .filter((mint): mint is OnChainToken => 
+          mint !== null && 
+          (mint.symbol.toLowerCase().includes(searchQuery) || 
+           mint.name.toLowerCase().includes(searchQuery))
+        )
+        .forEach(mint => {
+          if (!results.has(mint.address)) {
+            results.set(mint.address, mint);
+          }
+        });
+    } catch (error) {
+      console.error('Error searching recent mints:', error);
     }
 
-    console.log(`Total results found: ${results.size}`);
+    // Convert results map to array and limit to top 50 matches
     return Array.from(results.values()).slice(0, 50);
+
   } catch (error) {
     console.error('Error searching tokens:', error);
     throw error;
@@ -197,11 +177,11 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
     // First check Jupiter's list
     const jupiterResponse = await fetch('https://token.jup.ag/all');
     const tokens: JupiterToken[] = await jupiterResponse.json();
-    const jupiterToken = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
+    const jupiterToken = tokens.find(t => t.address === address);
     
     let createdAt: Date | undefined;
     
-    // Get creation date
+    // Get creation date from on-chain data
     try {
       const signatures = await connection.getSignaturesForAddress(
         new PublicKey(address),
@@ -234,13 +214,14 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
       const data = tokenInfo.value.data;
       if ('parsed' in data && data.parsed.type === 'mint') {
         const tokenData = data.parsed.info;
-        return {
+        const onChainToken: OnChainToken = {
           address: address,
           name: tokenData.name || 'Unknown',
           symbol: tokenData.symbol || 'Unknown',
           source: 'on-chain',
           createdAt
         };
+        return onChainToken;
       }
     } catch (error) {
       console.error('Error getting on-chain token details:', error);

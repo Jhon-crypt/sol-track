@@ -26,15 +26,6 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
-// Known token addresses - helps with initial search but doesn't limit results
-const KNOWN_TOKENS: Record<string, { address: string; symbol: string; name: string }> = {
-  'BONK': {
-    address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
-    symbol: 'BONK',
-    name: 'Bonk'
-  }
-};
-
 // Use Helius RPC endpoint for better performance
 const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
 if (!HELIUS_API_KEY) {
@@ -372,7 +363,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase().trim();
 
-    // First try direct symbol lookup for exact matches
+    // Try direct symbol lookup first
     if (query.length <= 10) { // Only for reasonable ticker lengths
       const dasResults = await searchTokensBySymbol(query);
       for (const token of dasResults) {
@@ -393,103 +384,88 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       }
     }
 
-    // If no direct matches found, check known tokens
-    const knownTokenPromises = Object.entries(KNOWN_TOKENS)
-      .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
-      .map(async ([, tokenData]) => {
-        const tokenInfo = await getTokenInfoFromMint(tokenData.address);
-        if (tokenInfo) {
-          tokenInfo.source = 'known';
-          results.set(tokenData.address, tokenInfo);
-        }
-      });
+    // If no results from symbol search, try searching recent transactions
+    const recentSignatures = await retryWithBackoff(
+      () => connection.getSignaturesForAddress(
+        new PublicKey(TOKEN_PROGRAM_ID),
+        { limit: 100 }
+      ),
+      2
+    );
 
-    await Promise.all(knownTokenPromises);
-
-    // Only if still no results, search recent transactions
-    if (results.size === 0) {
-      const recentSignatures = await retryWithBackoff(
-        () => connection.getSignaturesForAddress(
-          new PublicKey(TOKEN_PROGRAM_ID),
-          { limit: 100 }
-        ),
-        2
-      );
-
-      // Process transactions in parallel batches
-      const batchSize = 10;
-      const batches: Array<Promise<void[]>> = [];
+    // Process transactions in parallel batches
+    const batchSize = 10;
+    const batches: Array<Promise<void[]>> = [];
+    
+    for (let i = 0; i < recentSignatures.length && results.size < 50; i += batchSize) {
+      const batch = recentSignatures.slice(i, i + batchSize);
       
-      for (let i = 0; i < recentSignatures.length && results.size < 50; i += batchSize) {
-        const batch = recentSignatures.slice(i, i + batchSize);
-        
-        const batchPromise = Promise.all(
-          batch.map(async (sig) => {
-            try {
-              let tx = transactionCache.get(sig.signature);
-              if (!tx) {
-                const parsedTx = await retryWithBackoff(
-                  () => connection.getParsedTransaction(sig.signature, {
-                    maxSupportedTransactionVersion: 0,
-                    commitment: 'confirmed'
-                  }),
-                  2
-                );
+      const batchPromise = Promise.all(
+        batch.map(async (sig) => {
+          try {
+            let tx = transactionCache.get(sig.signature);
+            if (!tx) {
+              const parsedTx = await retryWithBackoff(
+                () => connection.getParsedTransaction(sig.signature, {
+                  maxSupportedTransactionVersion: 0,
+                  commitment: 'confirmed'
+                }),
+                2
+              );
+              
+              if (parsedTx) {
+                tx = {
+                  meta: {
+                    postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
+                      mint: balance.mint
+                    }))
+                  },
+                  blockTime: parsedTx.blockTime
+                };
+                transactionCache.set(sig.signature, tx);
                 
-                if (parsedTx) {
-                  tx = {
-                    meta: {
-                      postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
-                        mint: balance.mint
-                      }))
-                    },
-                    blockTime: parsedTx.blockTime
-                  };
-                  transactionCache.set(sig.signature, tx);
-                  
-                  if (transactionCache.size > 1000) {
-                    const firstKey = Array.from(transactionCache.keys())[0];
-                    if (firstKey) {
-                      transactionCache.delete(firstKey);
-                    }
+                if (transactionCache.size > 1000) {
+                  const firstKey = Array.from(transactionCache.keys())[0];
+                  if (firstKey) {
+                    transactionCache.delete(firstKey);
                   }
                 }
               }
-
-              if (!tx?.meta?.postTokenBalances?.length) return;
-
-              const mintPromises = tx.meta.postTokenBalances
-                .map(balance => balance.mint)
-                .filter((mintAddress): mintAddress is string => 
-                  typeof mintAddress === 'string' &&
-                  !results.has(mintAddress)
-                )
-                .map(async (mintAddress) => {
-                  const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
-                  if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
-                    results.set(mintAddress, tokenInfo);
-                  }
-                });
-
-              await Promise.all(mintPromises);
-            } catch {
-              // Skip error logging for faster processing
             }
-          })
-        );
 
-        batches.push(batchPromise);
-        
-        if (batches.length === 3) {
-          await Promise.all(batches);
-          batches.length = 0;
-          await delay(300);
-        }
-      }
+            if (!tx?.meta?.postTokenBalances?.length) return;
 
-      if (batches.length > 0) {
+            const mintPromises = tx.meta.postTokenBalances
+              .map(balance => balance.mint)
+              .filter((mintAddress): mintAddress is string => 
+                typeof mintAddress === 'string' &&
+                !results.has(mintAddress)
+              )
+              .map(async (mintAddress) => {
+                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
+                if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
+                  results.set(mintAddress, tokenInfo);
+                }
+              });
+
+            await Promise.all(mintPromises);
+          } catch {
+            // Skip error logging for faster processing
+          }
+        })
+      );
+
+      batches.push(batchPromise);
+      
+      if (batches.length === 3) {
         await Promise.all(batches);
+        batches.length = 0;
+        await delay(300);
       }
+    }
+
+    if (batches.length > 0) {
+      await Promise.all(batches);
     }
 
     // Sort and return results
@@ -502,10 +478,6 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
         if (aExactMatch && !bExactMatch) return -1;
         if (!aExactMatch && bExactMatch) return 1;
 
-        // Then known tokens
-        if (a.source === 'known' && b.source !== 'known') return -1;
-        if (a.source !== 'known' && b.source === 'known') return 1;
-        
         // Then by mint date
         if (!a.mintDate && !b.mintDate) return 0;
         if (!a.mintDate) return 1;

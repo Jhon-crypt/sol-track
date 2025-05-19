@@ -22,8 +22,11 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
-// RPC endpoint for direct Solana connection
-const connection = new Connection('https://api.mainnet-beta.solana.com');
+// Use a faster RPC endpoint
+const connection = new Connection('https://api.mainnet-beta.solana.com', {
+  commitment: 'confirmed',
+  wsEndpoint: 'wss://api.mainnet-beta.solana.com/',
+});
 
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
@@ -72,67 +75,77 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       }
     }
 
-    // Search recent token mints
+    // Search recent token mints using multiple approaches
     try {
-      // Get more signatures to find more recent tokens
+      // First, get recent token program signatures
       const recentSignatures = await connection.getSignaturesForAddress(
         new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: 1000 } // Increased limit to find more tokens
+        { limit: 1000 }
       );
 
-      const mintAddresses = await Promise.all(
-        recentSignatures.map(async (sig) => {
-          try {
-            const tx = await connection.getTransaction(sig.signature);
-            if (!tx?.meta?.postTokenBalances?.length) return null;
-            
-            const mintAddress = tx.meta.postTokenBalances[0].mint;
-            const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
-            const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
-            
-            const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
-            
-            if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
-            
-            const data = tokenInfo.value.data;
-            if ('parsed' in data && data.parsed.type === 'mint') {
-              const tokenData = data.parsed.info;
-              const name = tokenData.name || 'Unknown';
-              const symbol = tokenData.symbol || 'Unknown';
+      // Process in smaller batches to avoid rate limits
+      const batchSize = 50;
+      for (let i = 0; i < recentSignatures.length; i += batchSize) {
+        const batch = recentSignatures.slice(i, i + batchSize);
+        
+        await Promise.all(
+          batch.map(async (sig) => {
+            try {
+              const tx = await connection.getParsedTransaction(sig.signature, {
+                maxSupportedTransactionVersion: 0
+              });
+              
+              if (!tx?.meta?.postTokenBalances?.length) return;
+              
+              // Look through all post balances for new token mints
+              for (const balance of tx.meta.postTokenBalances) {
+                const mintAddress = balance.mint;
+                
+                // Skip if we already found this token
+                if (results.has(mintAddress)) continue;
+                
+                const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+                const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
+                
+                try {
+                  const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
+                  
+                  if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
+                  
+                  const data = tokenInfo.value.data;
+                  if ('parsed' in data && data.parsed.type === 'mint') {
+                    const tokenData = data.parsed.info;
+                    const name = tokenData.name || 'Unknown';
+                    const symbol = tokenData.symbol || 'Unknown';
 
-              // Only include tokens that match the search query
-              if (!name.toLowerCase().includes(searchQuery) && 
-                  !symbol.toLowerCase().includes(searchQuery) &&
-                  !mintAddress.toLowerCase().includes(searchQuery)) {
-                return null;
+                    // Check if token matches search query
+                    if (!name.toLowerCase().includes(searchQuery) && 
+                        !symbol.toLowerCase().includes(searchQuery) &&
+                        !mintAddress.toLowerCase().includes(searchQuery)) {
+                      continue;
+                    }
+
+                    const mint: OnChainToken = {
+                      address: mintAddress,
+                      name: name,
+                      symbol: symbol,
+                      source: 'on-chain',
+                      mintDate,
+                      isNewToken
+                    };
+                    
+                    results.set(mintAddress, mint);
+                  }
+                } catch (error) {
+                  console.error('Error processing mint:', error);
+                }
               }
-
-              const mint: OnChainToken = {
-                address: mintAddress,
-                name: name,
-                symbol: symbol,
-                source: 'on-chain',
-                mintDate,
-                isNewToken
-              };
-              return mint;
+            } catch (error) {
+              console.error('Error processing transaction:', error);
             }
-            return null;
-          } catch (error) {
-            console.error('Error processing transaction:', error);
-            return null;
-          }
-        })
-      );
-
-      // Add valid mint addresses to results
-      mintAddresses
-        .filter((mint): mint is OnChainToken => mint !== null)
-        .forEach(mint => {
-          if (!results.has(mint.address)) {
-            results.set(mint.address, mint);
-          }
-        });
+          })
+        );
+      }
     } catch (error) {
       console.error('Error searching recent mints:', error);
     }
@@ -160,40 +173,29 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
 export async function getTokenDetails(address: string): Promise<TokenInfo | null> {
   try {
-    // First check Jupiter's list
-    const jupiterResponse = await fetch('https://token.jup.ag/all');
-    const tokens: JupiterToken[] = await jupiterResponse.json();
-    const jupiterToken = tokens.find(t => t.address === address);
-    
     let mintDate: Date | undefined;
     
-    // Get creation date from on-chain data
+    // Get mint date from on-chain data
     try {
       const signatures = await connection.getSignaturesForAddress(
         new PublicKey(address),
-        { limit: 1 }
+        { limit: 10 }
       );
 
       if (signatures.length > 0) {
-        const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
+        // Sort to get the earliest transaction
+        const sortedSigs = signatures.sort((a, b) => 
+          (a.blockTime || 0) - (b.blockTime || 0)
+        );
+        
+        const tx = await connection.getTransaction(sortedSigs[0].signature);
         mintDate = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
       }
     } catch (error) {
-      console.error('Error fetching token creation date:', error);
-    }
-    
-    if (jupiterToken) {
-      return {
-        address: jupiterToken.address,
-        name: jupiterToken.name,
-        symbol: jupiterToken.symbol,
-        source: 'jupiter',
-        mintDate,
-        isNewToken: false
-      };
+      console.error('Error fetching token mint date:', error);
     }
 
-    // If not found in Jupiter, try getting on-chain data
+    // Get token data
     try {
       const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(address));
       if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
@@ -201,15 +203,18 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
       const data = tokenInfo.value.data;
       if ('parsed' in data && data.parsed.type === 'mint') {
         const tokenData = data.parsed.info;
-        const onChainToken: OnChainToken = {
+        const isNewToken = mintDate ? 
+          (new Date().getTime() - mintDate.getTime() <= 24 * 60 * 60 * 1000) : 
+          false;
+        
+        return {
           address: address,
           name: tokenData.name || 'Unknown',
           symbol: tokenData.symbol || 'Unknown',
           source: 'on-chain',
           mintDate,
-          isNewToken: false
+          isNewToken
         };
-        return onChainToken;
       }
     } catch (error) {
       console.error('Error getting on-chain token details:', error);

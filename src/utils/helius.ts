@@ -1,4 +1,4 @@
-import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 // Base interface for token data
@@ -9,6 +9,7 @@ interface BaseToken {
   mintDate?: Date;
   isNewToken?: boolean;
   supply?: string;
+  holders?: number;
 }
 
 // Main token info interface used throughout the app
@@ -17,7 +18,7 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
-// Known token addresses
+// Known token addresses - helps with initial search but doesn't limit results
 const KNOWN_TOKENS: Record<string, { address: string; symbol: string; name: string }> = {
   'BONK': {
     address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
@@ -56,36 +57,78 @@ async function retryWithBackoff<T>(
   }
 }
 
-// Helper function to check if a transaction contains a mint instruction
-function hasMintInstruction(tx: ParsedTransactionWithMeta | null): boolean {
-  if (!tx?.meta?.innerInstructions?.length) return false;
-  
-  for (const inner of tx.meta.innerInstructions) {
-    for (const ix of inner.instructions) {
-      if ('parsed' in ix && ix.parsed && 
-          typeof ix.parsed === 'object' && 
-          'type' in ix.parsed && 
-          (ix.parsed.type === 'initializeMint' || ix.parsed.type === 'mintTo')) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-// Helper function to check if a string matches a token query
+// Enhanced token matching to find more related tokens
 function matchesTokenQuery(query: string, name: string, symbol: string, address: string): boolean {
-  query = query.toLowerCase();
-  name = name.toLowerCase();
-  symbol = symbol.toLowerCase();
-  address = address.toLowerCase();
+  query = query.toLowerCase().trim();
+  name = name.toLowerCase().trim();
+  symbol = symbol.toLowerCase().trim();
+  address = address.toLowerCase().trim();
+
+  // Break query into words for more flexible matching
+  const queryWords = query.split(/[\s_-]+/);
+  const nameWords = name.split(/[\s_-]+/);
+  const symbolWords = symbol.split(/[\s_-]+/);
 
   // Exact matches first
   if (symbol === query || name === query || address === query) {
     return true;
   }
 
-  // Then partial matches
+  // Check if any query word is contained in name or symbol
+  for (const word of queryWords) {
+    if (word.length < 2) continue; // Skip very short words
+    
+    // Check for variations of the word in name and symbol
+    const variations = [
+      word,
+      word + 's',
+      word.replace(/s$/, ''),
+      word + '2',
+      word + '3',
+      word + 'inu',
+      word + 'sol',
+      'sol' + word,
+      word + 'coin',
+      word + 'token',
+    ];
+
+    for (const variation of variations) {
+      if (name.includes(variation) || symbol.includes(variation)) {
+        return true;
+      }
+    }
+
+    // Check each word in name and symbol
+    for (const nameWord of nameWords) {
+      if (nameWord.includes(word) || word.includes(nameWord)) {
+        return true;
+      }
+    }
+    for (const symbolWord of symbolWords) {
+      if (symbolWord.includes(word) || word.includes(symbolWord)) {
+        return true;
+      }
+    }
+  }
+
+  // Check for common token naming patterns
+  const commonPatterns = [
+    query + 'inu',
+    query + 'sol',
+    'sol' + query,
+    query + 'coin',
+    query + 'token',
+    query + '2',
+    query + '3',
+  ];
+
+  for (const pattern of commonPatterns) {
+    if (name.includes(pattern) || symbol.includes(pattern)) {
+      return true;
+    }
+  }
+
+  // Partial matches
   return symbol.includes(query) || 
          query.includes(symbol) ||
          name.includes(query) ||
@@ -99,7 +142,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     const currentTime = new Date();
     const ONE_DAY = 24 * 60 * 60 * 1000;
 
-    // First check known tokens
+    // First check known tokens but don't stop here
     for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
       if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
         try {
@@ -134,68 +177,23 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       }
     }
 
-    // Check if the query looks like a contract address
-    const isAddressSearch = searchQuery.length >= 32;
-    
-    if (isAddressSearch) {
-      try {
-        const tokenInfo = await retryWithBackoff(() => 
-          connection.getParsedAccountInfo(new PublicKey(query))
-        );
-
-        if (tokenInfo.value?.data && typeof tokenInfo.value.data === 'object') {
-          const data = tokenInfo.value.data;
-          if ('parsed' in data && data.parsed.type === 'mint') {
-            const signatures = await retryWithBackoff(() =>
-              connection.getSignaturesForAddress(new PublicKey(query), { limit: 1 })
-            );
-
-            if (signatures.length > 0) {
-              const mintTx = await retryWithBackoff(() =>
-                connection.getParsedTransaction(signatures[0].signature, {
-                  maxSupportedTransactionVersion: 0
-                })
-              );
-              
-              const mintDate = mintTx?.blockTime ? new Date(mintTx.blockTime * 1000) : undefined;
-              const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : false;
-
-              const tokenData = data.parsed.info;
-              results.set(query, {
-                address: query,
-                name: tokenData.name || 'Unknown',
-                symbol: tokenData.symbol || 'Unknown',
-                source: 'on-chain',
-                mintDate,
-                isNewToken,
-                supply: tokenData.supply || '0'
-              });
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error searching by address:', error);
-      }
-    }
-
-    // Search recent token mints
+    // Search recent token mints with increased limit
     try {
-      // Get recent signatures with a smaller limit to avoid rate limits
+      // Get more recent signatures to find more tokens
       const recentSignatures = await retryWithBackoff(() =>
         connection.getSignaturesForAddress(
           new PublicKey(TOKEN_PROGRAM_ID),
-          { limit: 200 } // Increased but still manageable
+          { limit: 500 } // Increased to find more tokens
         )
       );
 
       // Process in smaller batches with delay between batches
-      const batchSize = 5; // Smaller batch size for more detailed processing
+      const batchSize = 10;
       for (let i = 0; i < recentSignatures.length; i += batchSize) {
         const batch = recentSignatures.slice(i, i + batchSize);
         
-        // Add delay between batches
         if (i > 0) {
-          await delay(1000); // Longer delay between batches
+          await delay(500); // Reduced delay to process more tokens faster
         }
 
         await Promise.all(
@@ -207,11 +205,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 })
               );
               
-              // Skip if not a mint transaction
-              if (!tx || !hasMintInstruction(tx)) return;
-              
-              // Look through post balances for new token mints
-              if (tx.meta?.postTokenBalances?.length) {
+              // Look through all token balances, not just mints
+              if (tx?.meta?.postTokenBalances?.length) {
                 for (const balance of tx.meta.postTokenBalances) {
                   const mintAddress = balance.mint;
                   
@@ -250,7 +245,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                       });
                     }
                   } catch (error) {
-                    console.error('Error processing mint:', error);
+                    console.error('Error processing token:', error);
                   }
                 }
               }
@@ -259,12 +254,17 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
             }
           })
         );
+
+        // If we've found a lot of tokens, break early
+        if (results.size >= 200) {
+          break;
+        }
       }
     } catch (error) {
-      console.error('Error searching recent mints:', error);
+      console.error('Error searching tokens:', error);
     }
 
-    // Sort by mint date
+    // Sort tokens
     const allTokens = Array.from(results.values());
     const sortedTokens = allTokens.sort((a, b) => {
       // Known tokens first
@@ -278,12 +278,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       return b.mintDate.getTime() - a.mintDate.getTime();
     });
 
-    // Put new tokens first within their category
-    const knownTokens = sortedTokens.filter(token => token.source === 'known');
-    const newTokens = sortedTokens.filter(token => token.source !== 'known' && token.isNewToken);
-    const oldTokens = sortedTokens.filter(token => token.source !== 'known' && !token.isNewToken);
-    
-    return [...knownTokens, ...newTokens, ...oldTokens].slice(0, 50);
+    // Return more results
+    return sortedTokens.slice(0, 100); // Increased limit to show more tokens
 
   } catch (error) {
     console.error('Error searching tokens:', error);

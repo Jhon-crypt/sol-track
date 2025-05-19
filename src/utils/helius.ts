@@ -37,22 +37,10 @@ if (!HELIUS_API_KEY) {
   throw new Error('NEXT_PUBLIC_HELIUS_API_KEY is not set in environment variables');
 }
 
-const HELIUS_URL = `https://api.helius.xyz/v0`;
+const HELIUS_URL = `https://api.helius.xyz/v0`;  // Fixed API URL
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
   commitment: 'confirmed'
 });
-
-// Cache for recent transactions to avoid re-fetching
-interface CachedTransaction {
-  meta?: {
-    postTokenBalances?: Array<{
-      mint: string;
-    }>;
-  };
-  blockTime?: number | null;
-}
-
-const transactionCache = new Map<string, CachedTransaction>();
 
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -118,6 +106,19 @@ interface HeliusTokenMetadata {
     name?: string;
     symbol?: string;
   };
+}
+
+// Interface for Helius DAS search response
+interface HeliusSearchResponse {
+  items: Array<{
+    token: {
+      mint: string;
+      name: string;
+      symbol: string;
+      supply?: string;
+      uri?: string;
+    };
+  }>;
 }
 
 // Helper function for Helius API calls
@@ -216,19 +217,6 @@ function matchesTokenQuery(query: string, name: string, symbol: string, address:
          address.includes(query);
 }
 
-// Helper function to get metadata address
-function findMetadataAddress(mint: PublicKey): PublicKey {
-  const [publicKey] = PublicKey.findProgramAddressSync(
-    [
-      Buffer.from('metadata'),
-      METADATA_PROGRAM_ID.toBuffer(),
-      mint.toBuffer(),
-    ],
-    METADATA_PROGRAM_ID
-  );
-  return publicKey;
-}
-
 // Helper function to sanitize text
 function sanitizeTokenText(text: string): string {
   // Remove non-printable characters and common garbage patterns
@@ -238,85 +226,6 @@ function sanitizeTokenText(text: string): string {
   
   // Return "Unknown" if the cleaned text is too short or empty
   return cleaned.length < 2 ? 'Unknown' : cleaned;
-}
-
-// Optimized token info fetching with metadata
-async function getTokenInfoFromMint(
-  mintAddress: string,
-  blockTime?: number | null
-): Promise<TokenInfo | null> {
-  try {
-    const mintPubkey = new PublicKey(mintAddress);
-    const [tokenInfo, metadataInfo] = await Promise.all([
-      retryWithBackoff(
-        () => connection.getParsedAccountInfo(mintPubkey),
-        2
-      ),
-      retryWithBackoff(
-        () => connection.getAccountInfo(findMetadataAddress(mintPubkey)),
-        1
-      ).catch(() => null) // Ignore metadata errors
-    ]);
-
-    if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
-
-    const data = tokenInfo.value.data;
-    if (!('parsed' in data) || data.parsed.type !== 'mint') return null;
-
-    const tokenData = data.parsed.info;
-    const currentTime = new Date();
-    const mintDate = blockTime ? new Date(blockTime * 1000) : undefined;
-    const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= 24 * 60 * 60 * 1000) : false;
-
-    // Try to decode metadata if available
-    let metadata;
-    if (metadataInfo?.data) {
-      try {
-        // Skip the metadata account discriminator
-        const nameLength = metadataInfo.data[4];
-        const name = metadataInfo.data.slice(5, 5 + nameLength).toString('utf8');
-        
-        const symbolStart = 5 + nameLength;
-        const symbolLength = metadataInfo.data[symbolStart];
-        const symbol = metadataInfo.data.slice(symbolStart + 1, symbolStart + 1 + symbolLength).toString('utf8');
-        
-        const uriStart = symbolStart + 1 + symbolLength;
-        const uriLength = metadataInfo.data[uriStart];
-        const uri = metadataInfo.data.slice(uriStart + 1, uriStart + 1 + uriLength).toString('utf8');
-
-        // Sanitize metadata values
-        metadata = {
-          name: sanitizeTokenText(name),
-          symbol: sanitizeTokenText(symbol),
-          uri
-        };
-      } catch {
-        // Ignore metadata parsing errors
-      }
-    }
-
-    // Use metadata values if available, fallback to mint data
-    const tokenName = metadata?.name || sanitizeTokenText(tokenData.name || '');
-    const tokenSymbol = metadata?.symbol || sanitizeTokenText(tokenData.symbol || '');
-
-    // Skip tokens with invalid names/symbols
-    if (tokenName === 'Unknown' && tokenSymbol === 'Unknown') {
-      return null;
-    }
-
-    return {
-      address: mintAddress,
-      name: tokenName,
-      symbol: tokenSymbol,
-      source: 'on-chain',
-      mintDate,
-      isNewToken,
-      supply: tokenData.supply || '0',
-      metadata
-    };
-  } catch {
-    return null; // Skip logging for faster processing
-  }
 }
 
 // Time range options for historical search
@@ -378,56 +287,62 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
       }
     }
 
-    // Search for tokens using Helius searchAssets API
+    // Search for tokens using Helius DAS API
     try {
-      const searchResults = await fetchHelius<HeliusTokenMetadata[]>('/token-metadata/search', {
+      const searchResults = await fetchHelius<HeliusSearchResponse>('/das/search', {
         query: searchQuery,
         limit: 100,
+        displayOptions: {
+          showNativeBalance: false,
+          showTokenMetadata: true,
+          showUnknownTokens: true,
+        },
+        ownerAddress: null,
+        nftCollectionFilter: null,
+        tokenType: "fungible",
       });
 
-      if (Array.isArray(searchResults)) {
-        for (const result of searchResults) {
-          if (!results.has(result.mint)) {
+      if (searchResults?.items) {
+        for (const item of searchResults.items) {
+          const token = item.token;
+          if (!token || results.has(token.mint)) continue;
+
+          try {
+            // Get mint date if available
+            let mintDate: Date | undefined;
             try {
-              const metadata = result.onChainMetadata;
-              const offChainMetadata = result.offChainMetadata;
-              
-              // Get mint date if available
-              let mintDate: Date | undefined;
-              try {
-                const signatures = await connection.getSignaturesForAddress(
-                  new PublicKey(result.mint),
-                  { limit: 1 }
-                );
-                if (signatures[0]?.blockTime) {
-                  mintDate = new Date(signatures[0].blockTime * 1000);
-                }
-              } catch (error) {
-                console.error('Error fetching mint date:', error);
-              }
-
-              const tokenInfo: TokenInfo = {
-                address: result.mint,
-                name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
-                symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
-                source: 'on-chain',
-                isNewToken: mintDate ? (currentTime - mintDate.getTime() <= timeRangeMs) : false,
-                mintDate,
-                supply: metadata?.tokenInfo?.supply?.toString() || '0',
-                metadata: {
-                  name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
-                  symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
-                  uri: metadata?.metadata?.uri
-                }
-              };
-
-              // Only include tokens that match our criteria
-              if (matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, tokenInfo.address)) {
-                results.set(result.mint, tokenInfo);
+              const signatures = await connection.getSignaturesForAddress(
+                new PublicKey(token.mint),
+                { limit: 1 }
+              );
+              if (signatures[0]?.blockTime) {
+                mintDate = new Date(signatures[0].blockTime * 1000);
               }
             } catch (error) {
-              console.error('Error processing search result:', error);
+              console.error('Error fetching mint date:', error);
             }
+
+            const tokenInfo: TokenInfo = {
+              address: token.mint,
+              name: token.name || 'Unknown',
+              symbol: token.symbol || 'Unknown',
+              source: 'on-chain',
+              isNewToken: mintDate ? (currentTime - mintDate.getTime() <= timeRangeMs) : false,
+              mintDate,
+              supply: token.supply?.toString() || '0',
+              metadata: {
+                name: token.name || 'Unknown',
+                symbol: token.symbol || 'Unknown',
+                uri: token.uri
+              }
+            };
+
+            // Only include tokens that match our criteria
+            if (matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, tokenInfo.address)) {
+              results.set(token.mint, tokenInfo);
+            }
+          } catch (error) {
+            console.error('Error processing search result:', error);
           }
         }
       }
@@ -483,29 +398,36 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
       console.error('Error fetching token mint date:', error);
     }
 
-    // Get token data
+    // Get token data using Helius API
     try {
-      const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(address));
-      if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
-      
-      const data = tokenInfo.value.data;
-      if ('parsed' in data && data.parsed.type === 'mint') {
-        const tokenData = data.parsed.info;
+      const tokenMetadata = await fetchHelius<HeliusTokenMetadata[]>('/token-metadata', {
+        mintAccounts: [address],
+        includeOffChain: true,
+      });
+
+      if (tokenMetadata?.[0]) {
+        const metadata = tokenMetadata[0].onChainMetadata;
+        const offChainMetadata = tokenMetadata[0].offChainMetadata;
         const isNewToken = mintDate ? 
           (new Date().getTime() - mintDate.getTime() <= 24 * 60 * 60 * 1000) : 
           false;
         
         return {
           address: address,
-          name: tokenData.name || 'Unknown',
-          symbol: tokenData.symbol || 'Unknown',
+          name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+          symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
           source: 'on-chain',
           mintDate,
-          isNewToken
+          isNewToken,
+          metadata: {
+            name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+            symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
+            uri: metadata?.metadata?.uri
+          }
         };
       }
     } catch (error) {
-      console.error('Error getting on-chain token details:', error);
+      console.error('Error getting token metadata:', error);
     }
 
     return null;

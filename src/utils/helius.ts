@@ -7,6 +7,7 @@ interface BaseToken {
   name: string;
   symbol: string;
   createdAt?: Date;
+  isNewToken?: boolean;  // Flag for newly minted tokens
 }
 
 // Jupiter API response interface
@@ -19,11 +20,13 @@ interface JupiterToken extends BaseToken {
 // Interface for tokens found through on-chain data
 interface OnChainToken extends BaseToken {
   source: 'on-chain';
+  isNewToken: boolean;
 }
 
 // Main token info interface used throughout the app
 export interface TokenInfo extends BaseToken {
   source: string;  // 'jupiter' | 'on-chain'
+  isNewToken: boolean;
 }
 
 // RPC endpoint for direct Solana connection
@@ -33,6 +36,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
+    const currentTime = new Date();
+    const ONE_DAY = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
     // Check if the query looks like a contract address
     const isAddressSearch = searchQuery.length >= 32;  // Solana addresses are 32-44 chars
@@ -58,46 +63,48 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       const matchingTokens = jupiterTokens.filter((token) => 
         token.symbol.toLowerCase().includes(searchQuery) || 
         token.name.toLowerCase().includes(searchQuery) ||
-        token.address.toLowerCase().includes(searchQuery)  // Also match partial address
+        token.address.toLowerCase().includes(searchQuery)
       );
 
       // Get creation dates for matching tokens
       await Promise.all(
         matchingTokens.map(async (token) => {
           try {
-            // Get recent signatures for the token's mint address
             const signatures = await connection.getSignaturesForAddress(
               new PublicKey(token.address),
-              { limit: 1 }  // Get only the earliest transaction
+              { limit: 1 }
             );
 
             if (signatures.length > 0) {
               const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
               const createdAt = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+              const isNewToken = createdAt ? (currentTime.getTime() - createdAt.getTime() <= ONE_DAY) : false;
 
               results.set(token.address, {
                 address: token.address,
                 name: token.name,
                 symbol: token.symbol,
                 source: 'jupiter',
-                createdAt
+                createdAt,
+                isNewToken
               });
             } else {
               results.set(token.address, {
                 address: token.address,
                 name: token.name,
                 symbol: token.symbol,
-                source: 'jupiter'
+                source: 'jupiter',
+                isNewToken: false
               });
             }
           } catch (error) {
             console.error('Error fetching token creation date:', error);
-            // Still add the token even if we can't get its creation date
             results.set(token.address, {
               address: token.address,
               name: token.name,
               symbol: token.symbol,
-              source: 'jupiter'
+              source: 'jupiter',
+              isNewToken: false
             });
           }
         })
@@ -119,9 +126,9 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
             const tx = await connection.getTransaction(sig.signature);
             if (!tx?.meta?.postTokenBalances?.length) return null;
             
-            // Get the mint address and timestamp from the transaction
             const mintAddress = tx.meta.postTokenBalances[0].mint;
             const createdAt = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+            const isNewToken = createdAt ? (currentTime.getTime() - createdAt.getTime() <= ONE_DAY) : true;
             
             const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
             
@@ -135,7 +142,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 name: tokenData.name || 'Unknown',
                 symbol: tokenData.symbol || 'Unknown',
                 source: 'on-chain',
-                createdAt
+                createdAt,
+                isNewToken
               };
               return mint;
             }
@@ -163,8 +171,20 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       console.error('Error searching recent mints:', error);
     }
 
-    // Convert results map to array and limit to top 50 matches
-    return Array.from(results.values()).slice(0, 50);
+    // Convert results map to array, sort by creation date (newest first), and separate new tokens
+    const allTokens = Array.from(results.values());
+    const sortedTokens = allTokens.sort((a, b) => {
+      if (!a.createdAt && !b.createdAt) return 0;
+      if (!a.createdAt) return 1;
+      if (!b.createdAt) return -1;
+      return b.createdAt.getTime() - a.createdAt.getTime();
+    });
+
+    // Put new tokens first, then the rest
+    const newTokens = sortedTokens.filter(token => token.isNewToken);
+    const oldTokens = sortedTokens.filter(token => !token.isNewToken);
+    
+    return [...newTokens, ...oldTokens].slice(0, 50);
 
   } catch (error) {
     console.error('Error searching tokens:', error);
@@ -202,7 +222,8 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
         name: jupiterToken.name,
         symbol: jupiterToken.symbol,
         source: 'jupiter',
-        createdAt
+        createdAt,
+        isNewToken: false
       };
     }
 
@@ -219,7 +240,8 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
           name: tokenData.name || 'Unknown',
           symbol: tokenData.symbol || 'Unknown',
           source: 'on-chain',
-          createdAt
+          createdAt,
+          isNewToken: false
         };
         return onChainToken;
       }

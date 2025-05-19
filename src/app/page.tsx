@@ -127,66 +127,142 @@ export default function Home() {
 
         {/* Results Section */}
         {tokens.length > 0 && (
-          <div className="space-y-4">
-            <h3 className="text-xl font-semibold mb-4">Search Results</h3>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {tokens.map((token) => (
-                <div
-                  key={token.address}
-                  className="p-4 rounded-lg bg-[#1E293B] border border-gray-800 hover:border-gray-700 transition-colors duration-200"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div>
-                      <h3 className="text-lg font-medium">{token.name}</h3>
-                      <p className="text-blue-400 font-mono">{token.symbol}</p>
-                      {token.createdAt && (
-                        <p className="text-xs text-gray-400 mt-1">
-                          Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
-                          {new Date(token.createdAt).toLocaleTimeString()}
-                        </p>
-                      )}
-                    </div>
-                    <div className="flex flex-col items-end gap-2">
-                      <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
-                        {token.source}
-                      </span>
-                      {!token.createdAt && (
-                        <span className="text-xs text-gray-500">Creation date unknown</span>
-                      )}
-                    </div>
-                  </div>
-                  
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-400">Contract Address:</span>
-                      <div className="flex items-center space-x-2">
-                        <button
-                          onClick={() => copyToClipboard(token.address)}
-                          className="group flex items-center space-x-1 text-gray-400 hover:text-white transition-colors duration-200"
-                        >
-                          {copiedAddress === token.address ? (
-                            <CheckCircleIcon className="h-5 w-5 text-green-500" />
-                          ) : (
-                            <ClipboardIcon className="h-5 w-5" />
-                          )}
-                        </button>
-                        <a
-                          href={`https://solscan.io/token/${token.address}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-gray-400 hover:text-white transition-colors duration-200"
-                        >
-                          <ArrowTopRightOnSquareIcon className="h-5 w-5" />
-                        </a>
+          <div className="space-y-8">
+            {/* New Tokens Section */}
+            {tokens.filter(t => t.isNewToken).length > 0 && (
+              <div>
+                <h3 className="text-xl font-semibold mb-4 flex items-center">
+                  <span className="text-green-400">New Tokens</span>
+                  <span className="ml-2 px-2 py-1 text-xs bg-green-900 text-green-300 rounded-full">
+                    Last 24h
+                  </span>
+                </h3>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {tokens
+                    .filter(token => token.isNewToken)
+                    .map((token) => (
+                      <div
+                        key={token.address}
+                        className="p-4 rounded-lg bg-[#1E293B] border border-green-800 hover:border-green-700 transition-colors duration-200"
+                      >
+                        <div className="flex items-start justify-between mb-3">
+                          <div>
+                            <h3 className="text-lg font-medium">{token.name}</h3>
+                            <p className="text-blue-400 font-mono">{token.symbol}</p>
+                            {token.createdAt && (
+                              <p className="text-xs text-green-400 mt-1">
+                                Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
+                                {new Date(token.createdAt).toLocaleTimeString()}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-col items-end gap-2">
+                            <span className="px-2 py-1 text-xs rounded-full bg-green-900 text-green-300">
+                              {token.source}
+                            </span>
+                          </div>
+                        </div>
+                        
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-gray-400">Contract Address:</span>
+                            <div className="flex items-center space-x-2">
+                              <button
+                                onClick={() => copyToClipboard(token.address)}
+                                className="group flex items-center space-x-1 text-gray-400 hover:text-white transition-colors duration-200"
+                              >
+                                {copiedAddress === token.address ? (
+                                  <CheckCircleIcon className="h-5 w-5 text-green-500" />
+                                ) : (
+                                  <ClipboardIcon className="h-5 w-5" />
+                                )}
+                              </button>
+                              <a
+                                href={`https://solscan.io/token/${token.address}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-gray-400 hover:text-white transition-colors duration-200"
+                              >
+                                <ArrowTopRightOnSquareIcon className="h-5 w-5" />
+                              </a>
+                            </div>
+                          </div>
+                          <p className="font-mono text-sm text-gray-300 break-all">
+                            {token.address}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                    <p className="font-mono text-sm text-gray-300 break-all">
-                      {token.address}
-                    </p>
-                  </div>
+                    ))}
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
+
+            {/* Indexed Tokens Section */}
+            {tokens.filter(t => !t.isNewToken).length > 0 && (
+              <div>
+                <h3 className="text-xl font-semibold mb-4">Indexed Tokens</h3>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {tokens
+                    .filter(token => !token.isNewToken)
+                    .map((token) => (
+                      <div
+                        key={token.address}
+                        className="p-4 rounded-lg bg-[#1E293B] border border-gray-800 hover:border-gray-700 transition-colors duration-200"
+                      >
+                        <div className="flex items-start justify-between mb-3">
+                          <div>
+                            <h3 className="text-lg font-medium">{token.name}</h3>
+                            <p className="text-blue-400 font-mono">{token.symbol}</p>
+                            {token.createdAt && (
+                              <p className="text-xs text-gray-400 mt-1">
+                                Created: {new Date(token.createdAt).toLocaleDateString()} at{' '}
+                                {new Date(token.createdAt).toLocaleTimeString()}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-col items-end gap-2">
+                            <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
+                              {token.source}
+                            </span>
+                            {!token.createdAt && (
+                              <span className="text-xs text-gray-500">Creation date unknown</span>
+                            )}
+                          </div>
+                        </div>
+                        
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-gray-400">Contract Address:</span>
+                            <div className="flex items-center space-x-2">
+                              <button
+                                onClick={() => copyToClipboard(token.address)}
+                                className="group flex items-center space-x-1 text-gray-400 hover:text-white transition-colors duration-200"
+                              >
+                                {copiedAddress === token.address ? (
+                                  <CheckCircleIcon className="h-5 w-5 text-green-500" />
+                                ) : (
+                                  <ClipboardIcon className="h-5 w-5" />
+                                )}
+                              </button>
+                              <a
+                                href={`https://solscan.io/token/${token.address}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-gray-400 hover:text-white transition-colors duration-200"
+                              >
+                                <ArrowTopRightOnSquareIcon className="h-5 w-5" />
+                              </a>
+                            </div>
+                          </div>
+                          <p className="font-mono text-sm text-gray-300 break-all">
+                            {token.address}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

@@ -1,48 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
-// Define the asset interface to fix the 'any' type issues
-interface AssetContent {
-  metadata?: {
-    name?: string;
-    symbol?: string;
-    description?: string;
-  };
-}
-
-interface Asset {
-  id: string;
-  content?: AssetContent;
-  authorities?: Array<{ address: string }>;
-  createdAt?: string;
-}
-
-export interface TokenMetadata {
-  name?: string;
-  symbol?: string;
-  description?: string;
-  image?: string;
-  attributes?: Array<{
-    trait_type: string;
-    value: string;
-  }>;
-  properties?: Record<string, unknown>;
-}
-
-interface TokenResult {
-  id: string;
-  content?: {
-    metadata?: {
-      name?: string;
-      symbol?: string;
-    };
-  };
-  mint?: string;
-  ownership?: {
-    owner?: string;
-  };
-}
-
 interface JupiterToken {
   address: string;
   symbol: string;
@@ -53,7 +11,8 @@ export interface TokenInfo {
   address: string;
   name: string;
   symbol: string;
-  source: string;  // Make source required
+  source: string;
+  createdAt?: Date;
 }
 
 interface OnChainMint {
@@ -61,6 +20,7 @@ interface OnChainMint {
   name: string;
   symbol: string;
   source: 'on-chain';
+  createdAt?: Date;
 }
 
 // RPC endpoint for direct Solana connection
@@ -106,8 +66,10 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
             const tx = await connection.getTransaction(sig.signature);
             if (!tx?.meta?.postTokenBalances?.length) return null;
             
-            // Get the mint address from the transaction
+            // Get the mint address and timestamp from the transaction
             const mintAddress = tx.meta.postTokenBalances[0].mint;
+            const createdAt = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+            
             const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
             
             if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
@@ -119,7 +81,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 address: mintAddress,
                 name: tokenData.name || 'Unknown',
                 symbol: tokenData.symbol || 'Unknown',
-                source: 'on-chain'
+                source: 'on-chain',
+                createdAt
               };
               return mint;
             }

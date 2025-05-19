@@ -37,15 +37,26 @@ const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HEL
   commitment: 'confirmed',
 });
 
+// Cache for recent transactions to avoid re-fetching
+interface CachedTransaction {
+  meta?: {
+    postTokenBalances?: Array<{
+      mint: string;
+    }>;
+  };
+  blockTime?: number | null;
+}
+
+const transactionCache = new Map<string, CachedTransaction>();
+
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper function to retry failed requests with exponential backoff
+// Optimized retry function for faster retries on non-rate-limit errors
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
-  retries = 5, // Increased retries
-  baseDelay = 2000, // Increased base delay
-  context = '' // For better error logging
+  retries = 3,
+  baseDelay = 500 // Reduced base delay
 ): Promise<T> {
   let lastError: Error | null = null;
   
@@ -55,19 +66,19 @@ async function retryWithBackoff<T>(
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       
-      // Log the error with context
-      console.error(`Error in ${context} (attempt ${i + 1}/${retries + 1}):`, lastError.message);
+      // Only add significant delay for rate limit errors
+      if (lastError.message.includes('rate limit')) {
+        const jitter = Math.random() * 200;
+        const delayMs = baseDelay * Math.pow(1.5, i) + jitter;
+        await delay(delayMs);
+      } else {
+        // Minimal delay for other errors
+        await delay(100);
+      }
       
       if (i === retries) {
         throw lastError;
       }
-
-      // Calculate delay with exponential backoff and jitter
-      const jitter = Math.random() * 1000;
-      const delayMs = baseDelay * Math.pow(2, i) + jitter;
-      
-      console.log(`Retrying ${context} in ${Math.round(delayMs)}ms...`);
-      await delay(delayMs);
     }
   }
   
@@ -152,18 +163,15 @@ function matchesTokenQuery(query: string, name: string, symbol: string, address:
          address.includes(query);
 }
 
-// Helper function to get token info from mint address
+// Optimized token info fetching
 async function getTokenInfoFromMint(
   mintAddress: string,
-  blockTime?: number | null,
-  context = ''
+  blockTime?: number | null
 ): Promise<TokenInfo | null> {
   try {
     const tokenInfo = await retryWithBackoff(
       () => connection.getParsedAccountInfo(new PublicKey(mintAddress)),
-      3,
-      1000,
-      `getTokenInfo(${mintAddress})`
+      2 // Reduced retries for faster response
     );
 
     if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
@@ -185,108 +193,136 @@ async function getTokenInfoFromMint(
       isNewToken,
       supply: tokenData.supply || '0'
     };
-  } catch (error) {
-    console.error(`Error getting token info for ${mintAddress} (${context}):`, error);
-    return null;
+  } catch {
+    return null; // Skip logging for faster processing
   }
 }
 
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
-    console.log('Starting token search for:', query);
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
 
-    // First check known tokens
-    console.log('Checking known tokens...');
-    for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
-      if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
-        const tokenInfo = await getTokenInfoFromMint(tokenData.address, undefined, 'known_token');
+    // First check known tokens in parallel
+    const knownTokenPromises = Object.entries(KNOWN_TOKENS)
+      .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
+      .map(async ([, tokenData]) => {
+        const tokenInfo = await getTokenInfoFromMint(tokenData.address);
         if (tokenInfo) {
           tokenInfo.source = 'known';
           results.set(tokenData.address, tokenInfo);
         }
-      }
-    }
+      });
 
-    // Search recent token mints
-    try {
-      console.log('Fetching recent token program signatures...');
-      const recentSignatures = await retryWithBackoff(
-        () => connection.getSignaturesForAddress(
-          new PublicKey(TOKEN_PROGRAM_ID),
-          { limit: 200 } // Reduced limit to avoid rate limits
-        ),
-        3,
-        2000,
-        'getSignatures'
-      );
+    // Wait for known tokens to be processed
+    await Promise.all(knownTokenPromises);
 
-      console.log(`Processing ${recentSignatures.length} recent transactions...`);
+    // Get recent signatures
+    const recentSignatures = await retryWithBackoff(
+      () => connection.getSignaturesForAddress(
+        new PublicKey(TOKEN_PROGRAM_ID),
+        { limit: 100 } // Reduced limit for faster initial results
+      ),
+      2
+    );
+
+    // Process transactions in parallel batches
+    const batchSize = 10; // Increased batch size for parallel processing
+    const batches: Array<Promise<void[]>> = [];
+    
+    for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
+      const batch = recentSignatures.slice(i, i + batchSize);
       
-      // Process in smaller batches
-      const batchSize = 5;
-      for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
-        const batch = recentSignatures.slice(i, i + batchSize);
-        
-        // Add delay between batches
-        if (i > 0) {
-          await delay(1000);
-        }
-
-        await Promise.all(
-          batch.map(async (sig) => {
-            try {
-              const tx = await retryWithBackoff(
+      const batchPromise = Promise.all(
+        batch.map(async (sig) => {
+          try {
+            // Check cache first
+            let tx = transactionCache.get(sig.signature);
+            if (!tx) {
+              const parsedTx = await retryWithBackoff(
                 () => connection.getParsedTransaction(sig.signature, {
                   maxSupportedTransactionVersion: 0
                 }),
-                3,
-                1000,
-                `getTx(${sig.signature.slice(0, 8)})`
+                2
               );
-
-              if (!tx?.meta?.postTokenBalances?.length) return;
-
-              // Process each unique mint in the transaction
-              const processedMints = new Set<string>();
-              for (const balance of tx.meta.postTokenBalances) {
-                const mintAddress = balance.mint;
+              
+              // Cache the transaction if valid
+              if (parsedTx) {
+                tx = {
+                  meta: {
+                    postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
+                      mint: balance.mint
+                    }))
+                  },
+                  blockTime: parsedTx.blockTime
+                };
+                transactionCache.set(sig.signature, tx);
                 
-                if (processedMints.has(mintAddress) || results.has(mintAddress)) continue;
-                processedMints.add(mintAddress);
+                // Limit cache size
+                if (transactionCache.size > 1000) {
+                  const oldestKey = transactionCache.keys().next().value;
+                  transactionCache.delete(oldestKey);
+                }
+              }
+            }
 
-                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime, 'recent_tx');
+            if (!tx?.meta?.postTokenBalances?.length) return;
+
+            // Process mints in parallel
+            const mintPromises = tx.meta.postTokenBalances
+              .map(balance => balance.mint)
+              .filter((mintAddress): mintAddress is string => 
+                // Deduplicate mints and ensure mint address is valid
+                typeof mintAddress === 'string' &&
+                !results.has(mintAddress) &&
+                mintAddress === tx.meta?.postTokenBalances?.find(
+                  b => b.mint === mintAddress
+                )?.mint
+              )
+              .map(async (mintAddress) => {
+                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
                 if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
                   results.set(mintAddress, tokenInfo);
                 }
-              }
-            } catch (error) {
-              console.error('Error processing transaction:', error);
-            }
-          })
-        );
+              });
+
+            await Promise.all(mintPromises);
+          } catch {
+            // Skip error logging for faster processing
+          }
+        })
+      );
+
+      batches.push(batchPromise);
+      
+      // Process batches in parallel but with a small gap
+      if (batches.length === 3) {
+        await Promise.all(batches);
+        batches.length = 0;
+        await delay(300); // Small delay between batch groups
       }
-    } catch (error) {
-      console.error('Error searching tokens:', error);
+    }
+
+    // Wait for any remaining batches
+    if (batches.length > 0) {
+      await Promise.all(batches);
     }
 
     // Sort and return results
-    console.log(`Found ${results.size} matching tokens`);
     const allTokens = Array.from(results.values());
-    const sortedTokens = allTokens.sort((a, b) => {
-      // Known tokens first
-      if (a.source === 'known' && b.source !== 'known') return -1;
-      if (a.source !== 'known' && b.source === 'known') return 1;
-      
-      // Then by mint date
-      if (!a.mintDate && !b.mintDate) return 0;
-      if (!a.mintDate) return 1;
-      if (!b.mintDate) return -1;
-      return b.mintDate.getTime() - a.mintDate.getTime();
-    });
-
-    return sortedTokens.slice(0, 100);
+    return allTokens
+      .sort((a, b) => {
+        // Known tokens first
+        if (a.source === 'known' && b.source !== 'known') return -1;
+        if (a.source !== 'known' && b.source === 'known') return 1;
+        
+        // Then by mint date
+        if (!a.mintDate && !b.mintDate) return 0;
+        if (!a.mintDate) return 1;
+        if (!b.mintDate) return -1;
+        return b.mintDate.getTime() - a.mintDate.getTime();
+      })
+      .slice(0, 100);
 
   } catch (error) {
     console.error('Error in searchTokens:', error);

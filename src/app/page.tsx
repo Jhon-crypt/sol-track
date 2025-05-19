@@ -176,6 +176,9 @@ export default function Home() {
                             <span className="px-2 py-1 text-xs rounded-full bg-green-900 text-green-300 whitespace-nowrap">
                               {token.source}
                             </span>
+                            <span className="text-xs text-gray-500 whitespace-nowrap flex items-center">
+                              via Helius
+                            </span>
                           </div>
                         </div>
                         
@@ -250,6 +253,9 @@ export default function Home() {
                             {!token.mintDate && (
                               <span className="text-xs text-gray-500 whitespace-nowrap">Mint date unknown</span>
                             )}
+                            <span className="text-xs text-gray-500 whitespace-nowrap flex items-center">
+                              via Helius
+                            </span>
                           </div>
                         </div>
                         

@@ -60,11 +60,12 @@ const transactionCache = new Map<string, CachedTransaction>();
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Optimized retry function for faster retries on non-rate-limit errors
+// Optimized retry function with better backoff strategy
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   retries = 3,
-  baseDelay = 500 // Reduced base delay
+  baseDelay = 1000, // Increased base delay
+  maxDelay = 10000  // Maximum delay cap
 ): Promise<T> {
   let lastError: Error | null = null;
   
@@ -74,19 +75,22 @@ async function retryWithBackoff<T>(
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
       
-      // Only add significant delay for rate limit errors
-      if (lastError.message.includes('rate limit')) {
-        const jitter = Math.random() * 200;
-        const delayMs = baseDelay * Math.pow(1.5, i) + jitter;
-        await delay(delayMs);
-      } else {
-        // Minimal delay for other errors
-        await delay(100);
-      }
-      
       if (i === retries) {
         throw lastError;
       }
+
+      // Calculate delay with exponential backoff and jitter
+      const exponentialDelay = Math.min(
+        baseDelay * Math.pow(2, i) + Math.random() * 1000,
+        maxDelay
+      );
+      
+      // Longer delays for rate limit errors
+      const delay = lastError.message.toLowerCase().includes('rate limit') 
+        ? exponentialDelay * 2 
+        : exponentialDelay;
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
   
@@ -233,51 +237,86 @@ async function getTokenInfoFromMint(
   }
 }
 
-// Interface for Helius DAS response
-interface DigitalAsset {
+// Interface for Helius API response
+interface HeliusAsset {
   id: string;
   content: {
     metadata: {
-      name: string;
-      symbol: string;
+      name?: string;
+      symbol?: string;
     };
   };
-  token_info: {
-    supply: string;
+  token_info?: {
+    supply?: string;
   };
-  created_at: string;
+  created_at?: string;
+}
+
+interface HeliusResponse {
+  jsonrpc: string;
+  result: {
+    items: HeliusAsset[];
+    total: number;
+  };
+  id: string;
+  error?: {
+    message: string;
+  };
 }
 
 // Fast token lookup using Helius DAS API
 async function searchTokensBySymbol(query: string): Promise<TokenInfo[]> {
   try {
-    const response = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query: {
-          symbol: query.toUpperCase()
-        },
-        options: {
-          limit: 10
-        }
-      })
-    });
+    // Use the correct API endpoint with proper rate limit handling
+    const response = await retryWithBackoff<HeliusResponse>(async () => {
+      const fetchResponse = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'token-search',
+          method: 'searchAssets',
+          params: {
+            ownerAddress: null,
+            tokenType: "fungible",
+            displayOptions: {
+              showNativeBalance: false,
+              showUnderlyingAssetInfo: false,
+            },
+            grouping: ["symbol"],
+            page: 1,
+            limit: 10,
+            symbol: query.toUpperCase(),
+          }
+        })
+      });
 
-    if (!response.ok) {
-      throw new Error('Failed to fetch from Helius DAS API');
-    }
+      if (!fetchResponse.ok) {
+        throw new Error(`Failed to fetch from Helius API: ${fetchResponse.statusText}`);
+      }
 
-    const assets: DigitalAsset[] = await response.json();
-    return assets.map(asset => ({
-      address: asset.id,
-      name: asset.content.metadata.name,
-      symbol: asset.content.metadata.symbol,
-      source: 'helius-das',
-      isNewToken: false, // We'll update this later if needed
-      supply: asset.token_info.supply,
-      mintDate: new Date(asset.created_at)
-    }));
+      const data: HeliusResponse = await fetchResponse.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Helius API error');
+      }
+
+      return data;
+    }, 3, 1000); // More retries with longer base delay
+
+    if (!response?.result?.items) return [];
+
+    return response.result.items
+      .filter((asset): asset is HeliusAsset => Boolean(asset?.content?.metadata?.symbol)) // Only return tokens with symbols
+      .map(asset => ({
+        address: asset.id,
+        name: asset.content.metadata.name || 'Unknown',
+        symbol: asset.content.metadata.symbol || 'Unknown',
+        source: 'helius-das',
+        isNewToken: false,
+        supply: asset.token_info?.supply?.toString() || '0',
+        mintDate: asset.created_at ? new Date(asset.created_at) : undefined
+      }));
+
   } catch (error) {
     console.error('Error searching tokens by symbol:', error);
     return [];
@@ -491,4 +530,5 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
     console.error('Error getting token details:', error);
     throw error;
   }
+} 
 } 

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { searchTokens, TokenInfo } from '@/utils/helius';
+import { searchTokens, TokenInfo, TimeRange } from '@/utils/helius';
 import { ClipboardIcon, ArrowTopRightOnSquareIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { CheckCircleIcon } from '@heroicons/react/24/solid';
 
@@ -12,6 +12,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
+  const [timeRange, setTimeRange] = useState<TimeRange>('24h');
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -23,7 +24,7 @@ export default function Home() {
     setHasSearched(true);
 
     try {
-      const results = await searchTokens(searchQuery);
+      const results = await searchTokens(searchQuery, timeRange);
       setTokens(results);
     } catch (err) {
       setError('Failed to search tokens. Please try again.');
@@ -61,24 +62,7 @@ export default function Home() {
             <div className="flex items-center">
               <h1 className="text-xl font-bold">Solana Token Explorer</h1>
             </div>
-            <div className="flex items-center space-x-4">
-              <a
-                href="https://solscan.io"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-gray-300 hover:text-white text-sm"
-              >
-                Solscan
-              </a>
-              <a
-                href="https://explorer.solana.com"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-gray-300 hover:text-white text-sm"
-              >
-                Solana Explorer
-              </a>
-            </div>
+            
           </div>
         </div>
       </nav>
@@ -112,6 +96,16 @@ export default function Home() {
               </button>
             )}
           </div>
+          <select
+            value={timeRange}
+            onChange={(e) => setTimeRange(e.target.value as TimeRange)}
+            className="px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:outline-none focus:border-purple-500 text-white"
+          >
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+            <option value="all">All time</option>
+          </select>
           <button
             onClick={handleSearch}
             disabled={loading || !searchQuery.trim()}
@@ -150,7 +144,10 @@ export default function Home() {
                 <h3 className="text-xl font-semibold mb-4 flex items-center">
                   <span className="text-green-400">New Tokens</span>
                   <span className="ml-2 px-2 py-1 text-xs bg-green-900 text-green-300 rounded-full">
-                    Last 24h
+                    {timeRange === '24h' ? 'Last 24h' : 
+                     timeRange === '7d' ? 'Last 7 days' : 
+                     timeRange === '30d' ? 'Last 30 days' : 
+                     'All time'}
                   </span>
                 </h3>
                 <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

@@ -274,10 +274,29 @@ async function getTokenInfoFromMint(
   }
 }
 
-export async function searchTokens(query: string): Promise<TokenInfo[]> {
+// Time range options for historical search
+export type TimeRange = '24h' | '7d' | '30d' | 'all';
+
+// Helper function to get milliseconds for time range
+function getTimeRangeInMs(range: TimeRange): number {
+  switch (range) {
+    case '24h':
+      return 24 * 60 * 60 * 1000;
+    case '7d':
+      return 7 * 24 * 60 * 60 * 1000;
+    case '30d':
+      return 30 * 24 * 60 * 60 * 1000;
+    case 'all':
+      return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+export async function searchTokens(query: string, timeRange: TimeRange = '24h'): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
+    const timeRangeMs = getTimeRangeInMs(timeRange);
+    const currentTime = new Date().getTime();
 
     // First check known tokens in parallel
     const knownTokenPromises = Object.entries(KNOWN_TOKENS)
@@ -293,17 +312,17 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     // Wait for known tokens to be processed
     await Promise.all(knownTokenPromises);
 
-    // Get recent signatures
+    // Get recent signatures with increased limit for historical search
     const recentSignatures = await retryWithBackoff(
       () => connection.getSignaturesForAddress(
         new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: 100 } // Reduced limit for faster initial results
+        { limit: timeRange === 'all' ? 1000 : 500 } // Increased limit for historical search
       ),
       2
     );
 
     // Process transactions in parallel batches
-    const batchSize = 10; // Increased batch size for parallel processing
+    const batchSize = 10;
     const batches: Array<Promise<void[]>> = [];
     
     for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
@@ -346,6 +365,12 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
             if (!tx?.meta?.postTokenBalances?.length) return;
 
+            // Check if transaction is within time range
+            if (tx.blockTime && timeRange !== 'all') {
+              const txTime = tx.blockTime * 1000;
+              if (currentTime - txTime > timeRangeMs) return;
+            }
+
             // Process mints in parallel
             const mintPromises = tx.meta.postTokenBalances
               .map(balance => balance.mint)
@@ -360,6 +385,10 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
               .map(async (mintAddress) => {
                 const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
                 if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
+                  // Update isNewToken based on selected time range
+                  if (tokenInfo.mintDate) {
+                    tokenInfo.isNewToken = currentTime - tokenInfo.mintDate.getTime() <= timeRangeMs;
+                  }
                   results.set(mintAddress, tokenInfo);
                 }
               });

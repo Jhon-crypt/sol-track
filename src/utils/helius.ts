@@ -22,10 +22,15 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
-// Use a faster RPC endpoint
-const connection = new Connection('https://api.mainnet-beta.solana.com', {
+// Use Helius RPC endpoint for better performance
+const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
+if (!HELIUS_API_KEY) {
+  throw new Error('NEXT_PUBLIC_HELIUS_API_KEY is not set in environment variables');
+}
+
+const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
   commitment: 'confirmed',
-  wsEndpoint: 'wss://api.mainnet-beta.solana.com/',
+  wsEndpoint: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
 });
 
 export async function searchTokens(query: string): Promise<TokenInfo[]> {

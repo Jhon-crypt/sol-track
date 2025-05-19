@@ -36,19 +36,53 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       const jupiterResponse = await fetch('https://token.jup.ag/all');
       const jupiterTokens: JupiterToken[] = await jupiterResponse.json();
       
-      jupiterTokens
-        .filter((token) => 
-          token.symbol.toLowerCase().includes(searchQuery) || 
-          token.name.toLowerCase().includes(searchQuery)
-        )
-        .forEach(token => {
-          results.set(token.address, {
-            address: token.address,
-            name: token.name,
-            symbol: token.symbol,
-            source: 'jupiter'
-          });
-        });
+      // Filter tokens first to minimize API calls
+      const matchingTokens = jupiterTokens.filter((token) => 
+        token.symbol.toLowerCase().includes(searchQuery) || 
+        token.name.toLowerCase().includes(searchQuery)
+      );
+
+      // Get creation dates for matching tokens
+      await Promise.all(
+        matchingTokens.map(async (token) => {
+          try {
+            // Get recent signatures for the token's mint address
+            const signatures = await connection.getSignaturesForAddress(
+              new PublicKey(token.address),
+              { limit: 1 }  // Get only the earliest transaction
+            );
+
+            if (signatures.length > 0) {
+              const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
+              const createdAt = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+
+              results.set(token.address, {
+                address: token.address,
+                name: token.name,
+                symbol: token.symbol,
+                source: 'jupiter',
+                createdAt
+              });
+            } else {
+              results.set(token.address, {
+                address: token.address,
+                name: token.name,
+                symbol: token.symbol,
+                source: 'jupiter'
+              });
+            }
+          } catch (error) {
+            console.error('Error fetching token creation date:', error);
+            // Still add the token even if we can't get its creation date
+            results.set(token.address, {
+              address: token.address,
+              name: token.name,
+              symbol: token.symbol,
+              source: 'jupiter'
+            });
+          }
+        })
+      );
     } catch (error) {
       console.error('Error fetching from Jupiter:', error);
     }
@@ -126,12 +160,30 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
     const tokens: JupiterToken[] = await jupiterResponse.json();
     const jupiterToken = tokens.find(t => t.address === address);
     
+    let createdAt: Date | undefined;
+    
+    // Get creation date from on-chain data
+    try {
+      const signatures = await connection.getSignaturesForAddress(
+        new PublicKey(address),
+        { limit: 1 }
+      );
+
+      if (signatures.length > 0) {
+        const tx = await connection.getTransaction(signatures[signatures.length - 1].signature);
+        createdAt = tx?.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+      }
+    } catch (error) {
+      console.error('Error fetching token creation date:', error);
+    }
+    
     if (jupiterToken) {
       return {
         address: jupiterToken.address,
         name: jupiterToken.name,
         symbol: jupiterToken.symbol,
-        source: 'jupiter'
+        source: 'jupiter',
+        createdAt
       };
     }
 
@@ -147,7 +199,8 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
           address: address,
           name: tokenData.name || 'Unknown',
           symbol: tokenData.symbol || 'Unknown',
-          source: 'on-chain'
+          source: 'on-chain',
+          createdAt
         };
         return onChainToken;
       }

@@ -239,17 +239,64 @@ async function getTokenInfoFromMint(
 
 // Interface for Helius API response
 interface HeliusAsset {
+  interface: string;
   id: string;
   content: {
     metadata: {
-      name?: string;
-      symbol?: string;
+      name: string;
+      symbol: string;
+      description?: string;
+    };
+    links?: {
+      image?: string;
     };
   };
+  authorities?: Array<{
+    address: string;
+    scopes: string[];
+  }>;
+  compression: {
+    compressed: boolean;
+    data_hash: string;
+    creator_hash: string;
+    asset_hash: string;
+    tree: string;
+    seq: number;
+    leaf_id: number;
+  };
+  grouping?: Array<{
+    group_key: string;
+    group_value: string;
+  }>;
+  royalty: {
+    royalty_model: string;
+    target: null | number;
+    percent: number;
+    basis_points: number;
+    primary_sale_happened: boolean;
+    locked: boolean;
+  };
+  supply: {
+    print_max_supply: number;
+    print_current_supply: number;
+    edition_nonce: number;
+  };
+  mutable: boolean;
+  burnt: boolean;
   token_info?: {
+    balance?: string;
     supply?: string;
+    mint?: string;
+  };
+  ownership: {
+    frozen: boolean;
+    delegated: boolean;
+    delegate: null | string;
+    owner: string;
+    ownership_model: string;
   };
   created_at?: string;
+  updated_at?: string;
 }
 
 interface HeliusResponse {
@@ -257,9 +304,12 @@ interface HeliusResponse {
   result: {
     items: HeliusAsset[];
     total: number;
+    limit: number;
+    page: number;
   };
   id: string;
   error?: {
+    code: number;
     message: string;
   };
 }
@@ -275,18 +325,12 @@ async function searchTokensBySymbol(query: string): Promise<TokenInfo[]> {
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 'token-search',
-          method: 'searchAssets',
+          method: 'getAssetsByGroup',
           params: {
-            ownerAddress: null,
-            tokenType: "fungible",
-            displayOptions: {
-              showNativeBalance: false,
-              showUnderlyingAssetInfo: false,
-            },
-            grouping: ["symbol"],
+            groupKey: 'symbol',
+            groupValue: query.toUpperCase(),
             page: 1,
-            limit: 10,
-            symbol: query.toUpperCase(),
+            limit: 10
           }
         })
       });

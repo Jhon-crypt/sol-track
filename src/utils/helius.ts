@@ -10,12 +10,6 @@ interface BaseToken {
   isNewToken?: boolean;
 }
 
-// Interface for tokens found through on-chain data
-interface OnChainToken extends BaseToken {
-  source: 'on-chain';
-  isNewToken: boolean;
-}
-
 // Main token info interface used throughout the app
 export interface TokenInfo extends BaseToken {
   source: string;
@@ -30,8 +24,27 @@ if (!HELIUS_API_KEY) {
 
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
   commitment: 'confirmed',
-  wsEndpoint: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
 });
+
+// Helper function to add delay between requests
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper function to retry failed requests
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  baseDelay = 1000
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: unknown) {
+    if (retries === 0 || !(error instanceof Error) || !error.message?.includes('rate limit')) {
+      throw error;
+    }
+    await delay(baseDelay);
+    return retryWithBackoff(fn, retries - 1, baseDelay * 2);
+  }
+}
 
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
@@ -45,21 +58,22 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     
     if (isAddressSearch) {
       try {
-        const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(query));
+        const tokenInfo = await retryWithBackoff(() => 
+          connection.getParsedAccountInfo(new PublicKey(query))
+        );
+
         if (tokenInfo.value?.data && typeof tokenInfo.value.data === 'object') {
           const data = tokenInfo.value.data;
           if ('parsed' in data && data.parsed.type === 'mint') {
-            const signatures = await connection.getSignaturesForAddress(
-              new PublicKey(query),
-              { limit: 10 }
+            const signatures = await retryWithBackoff(() =>
+              connection.getSignaturesForAddress(new PublicKey(query), { limit: 1 })
             );
 
             if (signatures.length > 0) {
-              const sortedSigs = signatures.sort((a, b) => 
-                (a.blockTime || 0) - (b.blockTime || 0)
+              const mintTx = await retryWithBackoff(() =>
+                connection.getTransaction(signatures[0].signature)
               );
               
-              const mintTx = await connection.getTransaction(sortedSigs[0].signature);
               const mintDate = mintTx?.blockTime ? new Date(mintTx.blockTime * 1000) : undefined;
               const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : false;
 
@@ -80,40 +94,51 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       }
     }
 
-    // Search recent token mints using multiple approaches
+    // Search recent token mints
     try {
-      // First, get recent token program signatures
-      const recentSignatures = await connection.getSignaturesForAddress(
-        new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: 1000 }
+      // Get recent signatures with a smaller limit to avoid rate limits
+      const recentSignatures = await retryWithBackoff(() =>
+        connection.getSignaturesForAddress(
+          new PublicKey(TOKEN_PROGRAM_ID),
+          { limit: 100 } // Reduced from 1000 to avoid rate limits
+        )
       );
 
-      // Process in smaller batches to avoid rate limits
-      const batchSize = 50;
+      // Process in smaller batches with delay between batches
+      const batchSize = 10; // Reduced batch size
       for (let i = 0; i < recentSignatures.length; i += batchSize) {
         const batch = recentSignatures.slice(i, i + batchSize);
         
+        // Add delay between batches
+        if (i > 0) {
+          await delay(500);
+        }
+
         await Promise.all(
           batch.map(async (sig) => {
             try {
-              const tx = await connection.getParsedTransaction(sig.signature, {
-                maxSupportedTransactionVersion: 0
-              });
+              const tx = await retryWithBackoff(() =>
+                connection.getParsedTransaction(sig.signature, {
+                  maxSupportedTransactionVersion: 0
+                })
+              );
               
               if (!tx?.meta?.postTokenBalances?.length) return;
               
-              // Look through all post balances for new token mints
+              // Look through post balances for new token mints
               for (const balance of tx.meta.postTokenBalances) {
                 const mintAddress = balance.mint;
                 
-                // Skip if we already found this token
+                // Skip if already found
                 if (results.has(mintAddress)) continue;
                 
                 const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
                 const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
                 
                 try {
-                  const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
+                  const tokenInfo = await retryWithBackoff(() =>
+                    connection.getParsedAccountInfo(new PublicKey(mintAddress))
+                  );
                   
                   if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
                   
@@ -123,23 +148,21 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                     const name = tokenData.name || 'Unknown';
                     const symbol = tokenData.symbol || 'Unknown';
 
-                    // Check if token matches search query
+                    // Check if matches search query
                     if (!name.toLowerCase().includes(searchQuery) && 
                         !symbol.toLowerCase().includes(searchQuery) &&
                         !mintAddress.toLowerCase().includes(searchQuery)) {
                       continue;
                     }
 
-                    const mint: OnChainToken = {
+                    results.set(mintAddress, {
                       address: mintAddress,
-                      name: name,
-                      symbol: symbol,
+                      name,
+                      symbol,
                       source: 'on-chain',
                       mintDate,
                       isNewToken
-                    };
-                    
-                    results.set(mintAddress, mint);
+                    });
                   }
                 } catch (error) {
                   console.error('Error processing mint:', error);

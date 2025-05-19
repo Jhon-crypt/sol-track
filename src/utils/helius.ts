@@ -6,15 +6,8 @@ interface BaseToken {
   address: string;
   name: string;
   symbol: string;
-  mintDate?: Date;  // Changed from createdAt to mintDate
+  mintDate?: Date;
   isNewToken?: boolean;
-}
-
-// Jupiter API response interface
-interface JupiterToken extends BaseToken {
-  address: string;
-  symbol: string;
-  name: string;
 }
 
 // Interface for tokens found through on-chain data
@@ -25,7 +18,7 @@ interface OnChainToken extends BaseToken {
 
 // Main token info interface used throughout the app
 export interface TokenInfo extends BaseToken {
-  source: string;  // 'jupiter' | 'on-chain'
+  source: string;
   isNewToken: boolean;
 }
 
@@ -40,42 +33,20 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     const ONE_DAY = 24 * 60 * 60 * 1000;
 
     // Check if the query looks like a contract address
-    const isAddressSearch = searchQuery.length >= 32;  // Solana addresses are 32-44 chars
+    const isAddressSearch = searchQuery.length >= 32;
     
     if (isAddressSearch) {
       try {
-        const tokenDetails = await getTokenDetails(query);
-        if (tokenDetails) {
-          results.set(tokenDetails.address, tokenDetails);
-          return Array.from(results.values());
-        }
-      } catch (error) {
-        console.error('Error searching by address:', error);
-      }
-    }
-
-    // 1. Search Jupiter's token list
-    try {
-      const jupiterResponse = await fetch('https://token.jup.ag/all');
-      const jupiterTokens: JupiterToken[] = await jupiterResponse.json();
-      
-      const matchingTokens = jupiterTokens.filter((token) => 
-        token.symbol.toLowerCase().includes(searchQuery) || 
-        token.name.toLowerCase().includes(searchQuery) ||
-        token.address.toLowerCase().includes(searchQuery)
-      );
-
-      await Promise.all(
-        matchingTokens.map(async (token) => {
-          try {
-            // Get all signatures and sort by timestamp to find the mint transaction
+        const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(query));
+        if (tokenInfo.value?.data && typeof tokenInfo.value.data === 'object') {
+          const data = tokenInfo.value.data;
+          if ('parsed' in data && data.parsed.type === 'mint') {
             const signatures = await connection.getSignaturesForAddress(
-              new PublicKey(token.address),
-              { limit: 10 } // Fetch more signatures to ensure we find the mint tx
+              new PublicKey(query),
+              { limit: 10 }
             );
 
             if (signatures.length > 0) {
-              // Sort signatures by block time to get the earliest one (mint transaction)
               const sortedSigs = signatures.sort((a, b) => 
                 (a.blockTime || 0) - (b.blockTime || 0)
               );
@@ -84,44 +55,29 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
               const mintDate = mintTx?.blockTime ? new Date(mintTx.blockTime * 1000) : undefined;
               const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : false;
 
-              results.set(token.address, {
-                address: token.address,
-                name: token.name,
-                symbol: token.symbol,
-                source: 'jupiter',
+              const tokenData = data.parsed.info;
+              results.set(query, {
+                address: query,
+                name: tokenData.name || 'Unknown',
+                symbol: tokenData.symbol || 'Unknown',
+                source: 'on-chain',
                 mintDate,
                 isNewToken
               });
-            } else {
-              results.set(token.address, {
-                address: token.address,
-                name: token.name,
-                symbol: token.symbol,
-                source: 'jupiter',
-                isNewToken: false
-              });
             }
-          } catch (error) {
-            console.error('Error fetching token mint date:', error);
-            results.set(token.address, {
-              address: token.address,
-              name: token.name,
-              symbol: token.symbol,
-              source: 'jupiter',
-              isNewToken: false
-            });
           }
-        })
-      );
-    } catch (error) {
-      console.error('Error fetching from Jupiter:', error);
+        }
+      } catch (error) {
+        console.error('Error searching by address:', error);
+      }
     }
 
-    // 2. Search recent token mints
+    // Search recent token mints
     try {
+      // Get more signatures to find more recent tokens
       const recentSignatures = await connection.getSignaturesForAddress(
         new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: 100 }
+        { limit: 1000 } // Increased limit to find more tokens
       );
 
       const mintAddresses = await Promise.all(
@@ -141,10 +97,20 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
             const data = tokenInfo.value.data;
             if ('parsed' in data && data.parsed.type === 'mint') {
               const tokenData = data.parsed.info;
+              const name = tokenData.name || 'Unknown';
+              const symbol = tokenData.symbol || 'Unknown';
+
+              // Only include tokens that match the search query
+              if (!name.toLowerCase().includes(searchQuery) && 
+                  !symbol.toLowerCase().includes(searchQuery) &&
+                  !mintAddress.toLowerCase().includes(searchQuery)) {
+                return null;
+              }
+
               const mint: OnChainToken = {
                 address: mintAddress,
-                name: tokenData.name || 'Unknown',
-                symbol: tokenData.symbol || 'Unknown',
+                name: name,
+                symbol: symbol,
                 source: 'on-chain',
                 mintDate,
                 isNewToken
@@ -159,12 +125,9 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
         })
       );
 
+      // Add valid mint addresses to results
       mintAddresses
-        .filter((mint): mint is OnChainToken => 
-          mint !== null && 
-          (mint.symbol.toLowerCase().includes(searchQuery) || 
-           mint.name.toLowerCase().includes(searchQuery))
-        )
+        .filter((mint): mint is OnChainToken => mint !== null)
         .forEach(mint => {
           if (!results.has(mint.address)) {
             results.set(mint.address, mint);
@@ -183,6 +146,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       return b.mintDate.getTime() - a.mintDate.getTime();
     });
 
+    // Put new tokens first
     const newTokens = sortedTokens.filter(token => token.isNewToken);
     const oldTokens = sortedTokens.filter(token => !token.isNewToken);
     

@@ -531,4 +531,3 @@ export async function getTokenDetails(address: string): Promise<TokenInfo | null
     throw error;
   }
 } 
-} 

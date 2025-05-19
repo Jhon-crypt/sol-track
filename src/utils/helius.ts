@@ -22,15 +22,6 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
-// Known token addresses - helps with initial search but doesn't limit results
-const KNOWN_TOKENS: Record<string, { address: string; symbol: string; name: string }> = {
-  'BONK': {
-    address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
-    symbol: 'BONK',
-    name: 'Bonk'
-  }
-};
-
 // Use Helius RPC endpoint for better performance
 const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
 if (!HELIUS_API_KEY) {
@@ -44,50 +35,6 @@ const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HEL
 
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Optimized retry function for faster retries on non-rate-limit errors
-async function retryWithBackoff<T>(
-  fn: () => Promise<T>,
-  retries = 3,
-  baseDelay = 500 // Reduced base delay
-): Promise<T> {
-  let lastError: Error | null = null;
-  
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const result = await fn();
-      // Check if result is null or undefined
-      if (result === null || result === undefined) {
-        throw new Error('Empty result from RPC');
-      }
-      return result;
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      console.error(`Attempt ${i + 1}/${retries + 1} failed:`, lastError.message);
-      
-      // Check for specific error types
-      const errorMessage = lastError.message.toLowerCase();
-      if (errorMessage.includes('rate limit') || errorMessage.includes('429')) {
-        const jitter = Math.random() * 200;
-        const delayMs = baseDelay * Math.pow(2, i) + jitter;
-        console.log(`Rate limit hit, waiting ${delayMs}ms`);
-        await delay(delayMs);
-      } else if (errorMessage.includes('timeout') || errorMessage.includes('failed to fetch')) {
-        // Network issues - wait a bit longer
-        await delay(1000);
-      } else {
-        // Other errors - shorter delay
-        await delay(200);
-      }
-      
-      if (i === retries) {
-        throw lastError;
-      }
-    }
-  }
-  
-  throw lastError;
-}
 
 // Interface for Helius token metadata response
 interface HeliusTokenMetadata {
@@ -124,19 +71,43 @@ interface HeliusSearchResponse {
 // Helper function for Helius API calls
 async function fetchHelius<T>(endpoint: string, data?: unknown): Promise<T> {
   const url = `${HELIUS_URL}${endpoint}?api-key=${HELIUS_API_KEY}`;
-  const response = await fetch(url, {
-    method: data ? 'POST' : 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: data ? JSON.stringify(data) : undefined,
-  });
+  let retries = 3;
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    throw new Error(`Helius API error: ${response.status} ${response.statusText}`);
+  while (retries >= 0) {
+    try {
+      const response = await fetch(url, {
+        method: data ? 'POST' : 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: data ? JSON.stringify(data) : undefined,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Helius API error: ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      if (!result) {
+        throw new Error('Empty response from API');
+      }
+
+      return result;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      console.error(`API call failed, retries left: ${retries}`, lastError.message);
+      
+      if (retries > 0) {
+        const delayMs = 500 * (3 - retries) + Math.random() * 200;
+        await delay(delayMs);
+      }
+      
+      retries--;
+    }
   }
-
-  return response.json();
+  
+  throw lastError;
 }
 
 // Enhanced token matching to find more related tokens
@@ -217,17 +188,6 @@ function matchesTokenQuery(query: string, name: string, symbol: string, address:
          address.includes(query);
 }
 
-// Helper function to sanitize text
-function sanitizeTokenText(text: string): string {
-  // Remove non-printable characters and common garbage patterns
-  const cleaned = text.replace(/[^\x20-\x7E]/g, '')  // Keep only printable ASCII
-                     .replace(/[^\w\s-]/g, '')        // Remove special characters except dash
-                     .trim();
-  
-  // Return "Unknown" if the cleaned text is too short or empty
-  return cleaned.length < 2 ? 'Unknown' : cleaned;
-}
-
 // Time range options for historical search
 export type TimeRange = '24h' | '7d' | '30d' | 'all';
 
@@ -252,40 +212,6 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     const searchQuery = query.toLowerCase();
     const timeRangeMs = getTimeRangeInMs(timeRange);
     const currentTime = new Date().getTime();
-
-    // First check known tokens
-    for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
-      if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
-        try {
-          // Get token metadata using Helius API
-          const tokenMetadata = await fetchHelius<HeliusTokenMetadata[]>('/token-metadata', {
-            mintAccounts: [tokenData.address],
-            includeOffChain: true,
-          });
-
-          if (tokenMetadata?.[0]) {
-            const metadata = tokenMetadata[0].onChainMetadata;
-            const offChainMetadata = tokenMetadata[0].offChainMetadata;
-            
-            results.set(tokenData.address, {
-              address: tokenData.address,
-              name: metadata?.metadata?.name || offChainMetadata?.name || tokenData.name,
-              symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || tokenData.symbol,
-              source: 'known',
-              isNewToken: false,
-              mintDate: undefined, // We'll fetch this separately if needed
-              metadata: {
-                name: metadata?.metadata?.name || offChainMetadata?.name || tokenData.name,
-                symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || tokenData.symbol,
-                uri: metadata?.metadata?.uri
-              }
-            });
-          }
-        } catch (error) {
-          console.error('Error fetching known token metadata:', error);
-        }
-      }
-    }
 
     // Search for tokens using Helius DAS API
     try {
@@ -356,11 +282,7 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     const allTokens = Array.from(results.values());
     return allTokens
       .sort((a, b) => {
-        // Known tokens first
-        if (a.source === 'known' && b.source !== 'known') return -1;
-        if (a.source !== 'known' && b.source === 'known') return 1;
-        
-        // Then by mint date
+        // Sort by mint date
         if (!a.mintDate && !b.mintDate) return 0;
         if (!a.mintDate) return 1;
         if (!b.mintDate) return -1;

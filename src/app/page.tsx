@@ -196,8 +196,8 @@ export default function Home() {
                               </button>
                               <a
                                 href={`https://solscan.io/token/${token.address}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
+          target="_blank"
+          rel="noopener noreferrer"
                                 className="text-gray-400 hover:text-white transition-colors duration-200"
                                 title="View on Solscan"
                               >
@@ -273,8 +273,8 @@ export default function Home() {
                               </button>
                               <a
                                 href={`https://solscan.io/token/${token.address}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
+          target="_blank"
+          rel="noopener noreferrer"
                                 className="text-gray-400 hover:text-white transition-colors duration-200"
                                 title="View on Solscan"
                               >
@@ -318,7 +318,7 @@ export default function Home() {
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
           </div>
         )}
-      </div>
+    </div>
     </main>
   );
 }

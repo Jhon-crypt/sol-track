@@ -1,8 +1,4 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
-
-// Metadata program ID
-const METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 
 // Base interface for token data
 interface BaseToken {
@@ -41,9 +37,9 @@ if (!HELIUS_API_KEY) {
   throw new Error('NEXT_PUBLIC_HELIUS_API_KEY is not set in environment variables');
 }
 
+const HELIUS_URL = `https://api.helius.xyz/v0`;
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
-  commitment: 'confirmed',
-  wsEndpoint: `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+  commitment: 'confirmed'
 });
 
 // Cache for recent transactions to avoid re-fetching
@@ -103,6 +99,43 @@ async function retryWithBackoff<T>(
   }
   
   throw lastError;
+}
+
+// Interface for Helius token metadata response
+interface HeliusTokenMetadata {
+  mint: string;
+  onChainMetadata: {
+    metadata?: {
+      name?: string;
+      symbol?: string;
+      uri?: string;
+    };
+    tokenInfo?: {
+      supply?: string;
+    };
+  };
+  offChainMetadata?: {
+    name?: string;
+    symbol?: string;
+  };
+}
+
+// Helper function for Helius API calls
+async function fetchHelius<T>(endpoint: string, data?: unknown): Promise<T> {
+  const url = `${HELIUS_URL}${endpoint}?api-key=${HELIUS_API_KEY}`;
+  const response = await fetch(url, {
+    method: data ? 'POST' : 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: data ? JSON.stringify(data) : undefined,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Helius API error: ${response.status} ${response.statusText}`);
+  }
+
+  return response.json();
 }
 
 // Enhanced token matching to find more related tokens
@@ -311,140 +344,95 @@ export async function searchTokens(query: string, timeRange: TimeRange = '24h'):
     const timeRangeMs = getTimeRangeInMs(timeRange);
     const currentTime = new Date().getTime();
 
-    // First check known tokens in parallel
-    const knownTokenPromises = Object.entries(KNOWN_TOKENS)
-      .filter(([symbol, tokenData]) => matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address))
-      .map(async ([, tokenData]) => {
+    // First check known tokens
+    for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
+      if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
         try {
-          console.log('Checking known token:', tokenData.name);
-          const tokenInfo = await getTokenInfoFromMint(tokenData.address);
-          if (tokenInfo) {
-            console.log('Found known token:', tokenInfo.name);
-            tokenInfo.source = 'known';
-            results.set(tokenData.address, tokenInfo);
+          // Get token metadata using Helius API
+          const tokenMetadata = await fetchHelius<HeliusTokenMetadata[]>('/token-metadata', {
+            mintAccounts: [tokenData.address],
+            includeOffChain: true,
+          });
+
+          if (tokenMetadata?.[0]) {
+            const metadata = tokenMetadata[0].onChainMetadata;
+            const offChainMetadata = tokenMetadata[0].offChainMetadata;
+            
+            results.set(tokenData.address, {
+              address: tokenData.address,
+              name: metadata?.metadata?.name || offChainMetadata?.name || tokenData.name,
+              symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || tokenData.symbol,
+              source: 'known',
+              isNewToken: false,
+              mintDate: undefined, // We'll fetch this separately if needed
+              metadata: {
+                name: metadata?.metadata?.name || offChainMetadata?.name || tokenData.name,
+                symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || tokenData.symbol,
+                uri: metadata?.metadata?.uri
+              }
+            });
           }
         } catch (error) {
-          console.error('Error processing known token:', tokenData.name, error);
+          console.error('Error fetching known token metadata:', error);
         }
-      });
-
-    // Wait for known tokens to be processed
-    await Promise.all(knownTokenPromises);
-    console.log('Known tokens processed, found:', results.size);
-
-    // Get recent signatures with increased limit for historical search
-    console.log('Fetching recent signatures...');
-    const recentSignatures = await retryWithBackoff(
-      () => connection.getSignaturesForAddress(
-        new PublicKey(TOKEN_PROGRAM_ID),
-        { limit: timeRange === 'all' ? 1000 : 500 }
-      ),
-      3
-    );
-    console.log('Found signatures:', recentSignatures.length);
-
-    // Process transactions in smaller batches
-    const batchSize = 5; // Reduced batch size
-    const batches: Array<Promise<void[]>> = [];
-    
-    for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
-      const batch = recentSignatures.slice(i, i + batchSize);
-      console.log(`Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(recentSignatures.length/batchSize)}`);
-      
-      const batchPromise = Promise.all(
-        batch.map(async (sig) => {
-          try {
-            // Check cache first
-            let tx = transactionCache.get(sig.signature);
-            if (!tx) {
-              const parsedTx = await retryWithBackoff(
-                () => connection.getParsedTransaction(sig.signature, {
-                  maxSupportedTransactionVersion: 0
-                }),
-                2
-              );
-              
-              if (!parsedTx) {
-                console.log('No transaction data for signature:', sig.signature);
-                return;
-              }
-              
-              // Cache the transaction if valid
-              tx = {
-                meta: {
-                  postTokenBalances: parsedTx.meta?.postTokenBalances?.map(balance => ({
-                    mint: balance.mint
-                  }))
-                },
-                blockTime: parsedTx.blockTime
-              };
-              transactionCache.set(sig.signature, tx);
-              
-              // Limit cache size
-              if (transactionCache.size > 1000) {
-                const firstKey = Array.from(transactionCache.keys())[0];
-                if (firstKey) {
-                  transactionCache.delete(firstKey);
-                }
-              }
-            }
-
-            if (!tx?.meta?.postTokenBalances?.length) {
-              console.log('No token balances in transaction');
-              return;
-            }
-
-            // Check if transaction is within time range
-            if (tx.blockTime && timeRange !== 'all') {
-              const txTime = tx.blockTime * 1000;
-              if (currentTime - txTime > timeRangeMs) {
-                console.log('Transaction outside time range');
-                return;
-              }
-            }
-
-            // Process mints in parallel
-            const mintPromises = tx.meta.postTokenBalances
-              .map(balance => balance.mint)
-              .filter((mintAddress): mintAddress is string => 
-                typeof mintAddress === 'string' &&
-                !results.has(mintAddress)
-              )
-              .map(async (mintAddress) => {
-                try {
-                  const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime);
-                  if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
-                    console.log('Found matching token:', tokenInfo.name);
-                    if (tokenInfo.mintDate) {
-                      tokenInfo.isNewToken = currentTime - tokenInfo.mintDate.getTime() <= timeRangeMs;
-                    }
-                    results.set(mintAddress, tokenInfo);
-                  }
-                } catch (error) {
-                  console.error('Error processing mint:', mintAddress, error);
-                }
-              });
-
-            await Promise.all(mintPromises);
-          } catch (error) {
-            console.error('Error processing transaction:', sig.signature, error);
-          }
-        })
-      );
-
-      batches.push(batchPromise);
-      
-      // Process fewer batches in parallel and increase delay
-      if (batches.length === 2) {
-        await Promise.all(batches);
-        batches.length = 0;
-        await delay(500); // Increased delay between batch groups
       }
     }
 
-    // Wait for any remaining batches
-    if (batches.length > 0) {
-      await Promise.all(batches);
+    // Search for tokens using Helius searchAssets API
+    try {
+      const searchResults = await fetchHelius<HeliusTokenMetadata[]>('/token-metadata/search', {
+        query: searchQuery,
+        limit: 100,
+      });
+
+      if (Array.isArray(searchResults)) {
+        for (const result of searchResults) {
+          if (!results.has(result.mint)) {
+            try {
+              const metadata = result.onChainMetadata;
+              const offChainMetadata = result.offChainMetadata;
+              
+              // Get mint date if available
+              let mintDate: Date | undefined;
+              try {
+                const signatures = await connection.getSignaturesForAddress(
+                  new PublicKey(result.mint),
+                  { limit: 1 }
+                );
+                if (signatures[0]?.blockTime) {
+                  mintDate = new Date(signatures[0].blockTime * 1000);
+                }
+              } catch (error) {
+                console.error('Error fetching mint date:', error);
+              }
+
+              const tokenInfo: TokenInfo = {
+                address: result.mint,
+                name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+                symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
+                source: 'on-chain',
+                isNewToken: mintDate ? (currentTime - mintDate.getTime() <= timeRangeMs) : false,
+                mintDate,
+                supply: metadata?.tokenInfo?.supply?.toString() || '0',
+                metadata: {
+                  name: metadata?.metadata?.name || offChainMetadata?.name || 'Unknown',
+                  symbol: metadata?.metadata?.symbol || offChainMetadata?.symbol || 'Unknown',
+                  uri: metadata?.metadata?.uri
+                }
+              };
+
+              // Only include tokens that match our criteria
+              if (matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, tokenInfo.address)) {
+                results.set(result.mint, tokenInfo);
+              }
+            } catch (error) {
+              console.error('Error processing search result:', error);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error searching tokens:', error);
     }
 
     console.log('Search completed, total results:', results.size);

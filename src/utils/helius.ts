@@ -17,6 +17,15 @@ export interface TokenInfo extends BaseToken {
   isNewToken: boolean;
 }
 
+// Known token addresses
+const KNOWN_TOKENS: Record<string, { address: string; symbol: string; name: string }> = {
+  'BONK': {
+    address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+    symbol: 'BONK',
+    name: 'Bonk'
+  }
+};
+
 // Use Helius RPC endpoint for better performance
 const HELIUS_API_KEY = process.env.NEXT_PUBLIC_HELIUS_API_KEY;
 if (!HELIUS_API_KEY) {
@@ -64,12 +73,66 @@ function hasMintInstruction(tx: ParsedTransactionWithMeta | null): boolean {
   return false;
 }
 
+// Helper function to check if a string matches a token query
+function matchesTokenQuery(query: string, name: string, symbol: string, address: string): boolean {
+  query = query.toLowerCase();
+  name = name.toLowerCase();
+  symbol = symbol.toLowerCase();
+  address = address.toLowerCase();
+
+  // Exact matches first
+  if (symbol === query || name === query || address === query) {
+    return true;
+  }
+
+  // Then partial matches
+  return symbol.includes(query) || 
+         query.includes(symbol) ||
+         name.includes(query) ||
+         address.includes(query);
+}
+
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
     const currentTime = new Date();
     const ONE_DAY = 24 * 60 * 60 * 1000;
+
+    // First check known tokens
+    for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
+      if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
+        try {
+          const tokenInfo = await retryWithBackoff(() =>
+            connection.getParsedAccountInfo(new PublicKey(tokenData.address))
+          );
+
+          if (tokenInfo.value?.data && typeof tokenInfo.value.data === 'object') {
+            const data = tokenInfo.value.data;
+            if ('parsed' in data && data.parsed.type === 'mint') {
+              const signatures = await retryWithBackoff(() =>
+                connection.getSignaturesForAddress(new PublicKey(tokenData.address), { limit: 1 })
+              );
+
+              const mintDate = signatures[0]?.blockTime ? new Date(signatures[0].blockTime * 1000) : undefined;
+              const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : false;
+
+              results.set(tokenData.address, {
+                address: tokenData.address,
+                name: tokenData.name,
+                symbol: tokenData.symbol,
+                source: 'known',
+                mintDate,
+                isNewToken,
+                supply: data.parsed.info.supply || '0'
+              });
+            }
+          }
+        } catch (error) {
+          console.error(`Error fetching known token ${symbol}:`, error);
+        }
+      }
+    }
 
     // Check if the query looks like a contract address
     const isAddressSearch = searchQuery.length >= 32;
@@ -172,9 +235,7 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                       const symbol = tokenData.symbol || 'Unknown';
 
                       // Check if matches search query
-                      if (!name.toLowerCase().includes(searchQuery) && 
-                          !symbol.toLowerCase().includes(searchQuery) &&
-                          !mintAddress.toLowerCase().includes(searchQuery)) {
+                      if (!matchesTokenQuery(searchQuery, name, symbol, mintAddress)) {
                         continue;
                       }
 
@@ -206,17 +267,23 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
     // Sort by mint date
     const allTokens = Array.from(results.values());
     const sortedTokens = allTokens.sort((a, b) => {
+      // Known tokens first
+      if (a.source === 'known' && b.source !== 'known') return -1;
+      if (a.source !== 'known' && b.source === 'known') return 1;
+      
+      // Then by mint date
       if (!a.mintDate && !b.mintDate) return 0;
       if (!a.mintDate) return 1;
       if (!b.mintDate) return -1;
       return b.mintDate.getTime() - a.mintDate.getTime();
     });
 
-    // Put new tokens first
-    const newTokens = sortedTokens.filter(token => token.isNewToken);
-    const oldTokens = sortedTokens.filter(token => !token.isNewToken);
+    // Put new tokens first within their category
+    const knownTokens = sortedTokens.filter(token => token.source === 'known');
+    const newTokens = sortedTokens.filter(token => token.source !== 'known' && token.isNewToken);
+    const oldTokens = sortedTokens.filter(token => token.source !== 'known' && !token.isNewToken);
     
-    return [...newTokens, ...oldTokens].slice(0, 50);
+    return [...knownTokens, ...newTokens, ...oldTokens].slice(0, 50);
 
   } catch (error) {
     console.error('Error searching tokens:', error);

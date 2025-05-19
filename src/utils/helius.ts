@@ -40,21 +40,38 @@ const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HEL
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper function to retry failed requests
+// Helper function to retry failed requests with exponential backoff
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
-  retries = 3,
-  baseDelay = 1000
+  retries = 5, // Increased retries
+  baseDelay = 2000, // Increased base delay
+  context = '' // For better error logging
 ): Promise<T> {
-  try {
-    return await fn();
-  } catch (error: unknown) {
-    if (retries === 0 || !(error instanceof Error) || !error.message?.includes('rate limit')) {
-      throw error;
+  let lastError: Error | null = null;
+  
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      
+      // Log the error with context
+      console.error(`Error in ${context} (attempt ${i + 1}/${retries + 1}):`, lastError.message);
+      
+      if (i === retries) {
+        throw lastError;
+      }
+
+      // Calculate delay with exponential backoff and jitter
+      const jitter = Math.random() * 1000;
+      const delayMs = baseDelay * Math.pow(2, i) + jitter;
+      
+      console.log(`Retrying ${context} in ${Math.round(delayMs)}ms...`);
+      await delay(delayMs);
     }
-    await delay(baseDelay);
-    return retryWithBackoff(fn, retries - 1, baseDelay * 2);
   }
+  
+  throw lastError;
 }
 
 // Enhanced token matching to find more related tokens
@@ -135,118 +152,113 @@ function matchesTokenQuery(query: string, name: string, symbol: string, address:
          address.includes(query);
 }
 
+// Helper function to get token info from mint address
+async function getTokenInfoFromMint(
+  mintAddress: string,
+  blockTime?: number | null,
+  context = ''
+): Promise<TokenInfo | null> {
+  try {
+    const tokenInfo = await retryWithBackoff(
+      () => connection.getParsedAccountInfo(new PublicKey(mintAddress)),
+      3,
+      1000,
+      `getTokenInfo(${mintAddress})`
+    );
+
+    if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') return null;
+
+    const data = tokenInfo.value.data;
+    if (!('parsed' in data) || data.parsed.type !== 'mint') return null;
+
+    const tokenData = data.parsed.info;
+    const currentTime = new Date();
+    const mintDate = blockTime ? new Date(blockTime * 1000) : undefined;
+    const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= 24 * 60 * 60 * 1000) : false;
+
+    return {
+      address: mintAddress,
+      name: tokenData.name || 'Unknown',
+      symbol: tokenData.symbol || 'Unknown',
+      source: 'on-chain',
+      mintDate,
+      isNewToken,
+      supply: tokenData.supply || '0'
+    };
+  } catch (error) {
+    console.error(`Error getting token info for ${mintAddress} (${context}):`, error);
+    return null;
+  }
+}
+
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
+    console.log('Starting token search for:', query);
     const results = new Map<string, TokenInfo>();
     const searchQuery = query.toLowerCase();
-    const currentTime = new Date();
-    const ONE_DAY = 24 * 60 * 60 * 1000;
 
-    // First check known tokens but don't stop here
+    // First check known tokens
+    console.log('Checking known tokens...');
     for (const [symbol, tokenData] of Object.entries(KNOWN_TOKENS)) {
       if (matchesTokenQuery(searchQuery, tokenData.name, symbol, tokenData.address)) {
-        try {
-          const tokenInfo = await retryWithBackoff(() =>
-            connection.getParsedAccountInfo(new PublicKey(tokenData.address))
-          );
-
-          if (tokenInfo.value?.data && typeof tokenInfo.value.data === 'object') {
-            const data = tokenInfo.value.data;
-            if ('parsed' in data && data.parsed.type === 'mint') {
-              const signatures = await retryWithBackoff(() =>
-                connection.getSignaturesForAddress(new PublicKey(tokenData.address), { limit: 1 })
-              );
-
-              const mintDate = signatures[0]?.blockTime ? new Date(signatures[0].blockTime * 1000) : undefined;
-              const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : false;
-
-              results.set(tokenData.address, {
-                address: tokenData.address,
-                name: tokenData.name,
-                symbol: tokenData.symbol,
-                source: 'known',
-                mintDate,
-                isNewToken,
-                supply: data.parsed.info.supply || '0'
-              });
-            }
-          }
-        } catch (error) {
-          console.error(`Error fetching known token ${symbol}:`, error);
+        const tokenInfo = await getTokenInfoFromMint(tokenData.address, undefined, 'known_token');
+        if (tokenInfo) {
+          tokenInfo.source = 'known';
+          results.set(tokenData.address, tokenInfo);
         }
       }
     }
 
-    // Search recent token mints with increased limit
+    // Search recent token mints
     try {
-      // Get more recent signatures to find more tokens
-      const recentSignatures = await retryWithBackoff(() =>
-        connection.getSignaturesForAddress(
+      console.log('Fetching recent token program signatures...');
+      const recentSignatures = await retryWithBackoff(
+        () => connection.getSignaturesForAddress(
           new PublicKey(TOKEN_PROGRAM_ID),
-          { limit: 500 } // Increased to find more tokens
-        )
+          { limit: 200 } // Reduced limit to avoid rate limits
+        ),
+        3,
+        2000,
+        'getSignatures'
       );
 
-      // Process in smaller batches with delay between batches
-      const batchSize = 10;
-      for (let i = 0; i < recentSignatures.length; i += batchSize) {
+      console.log(`Processing ${recentSignatures.length} recent transactions...`);
+      
+      // Process in smaller batches
+      const batchSize = 5;
+      for (let i = 0; i < recentSignatures.length && results.size < 100; i += batchSize) {
         const batch = recentSignatures.slice(i, i + batchSize);
         
+        // Add delay between batches
         if (i > 0) {
-          await delay(500); // Reduced delay to process more tokens faster
+          await delay(1000);
         }
 
         await Promise.all(
           batch.map(async (sig) => {
             try {
-              const tx = await retryWithBackoff(() =>
-                connection.getParsedTransaction(sig.signature, {
+              const tx = await retryWithBackoff(
+                () => connection.getParsedTransaction(sig.signature, {
                   maxSupportedTransactionVersion: 0
-                })
+                }),
+                3,
+                1000,
+                `getTx(${sig.signature.slice(0, 8)})`
               );
-              
-              // Look through all token balances, not just mints
-              if (tx?.meta?.postTokenBalances?.length) {
-                for (const balance of tx.meta.postTokenBalances) {
-                  const mintAddress = balance.mint;
-                  
-                  // Skip if already found
-                  if (results.has(mintAddress)) continue;
-                  
-                  const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
-                  const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
-                  
-                  try {
-                    const tokenInfo = await retryWithBackoff(() =>
-                      connection.getParsedAccountInfo(new PublicKey(mintAddress))
-                    );
-                    
-                    if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
-                    
-                    const data = tokenInfo.value.data;
-                    if ('parsed' in data && data.parsed.type === 'mint') {
-                      const tokenData = data.parsed.info;
-                      const name = tokenData.name || 'Unknown';
-                      const symbol = tokenData.symbol || 'Unknown';
 
-                      // Check if matches search query
-                      if (!matchesTokenQuery(searchQuery, name, symbol, mintAddress)) {
-                        continue;
-                      }
+              if (!tx?.meta?.postTokenBalances?.length) return;
 
-                      results.set(mintAddress, {
-                        address: mintAddress,
-                        name,
-                        symbol,
-                        source: 'on-chain',
-                        mintDate,
-                        isNewToken,
-                        supply: tokenData.supply || '0'
-                      });
-                    }
-                  } catch (error) {
-                    console.error('Error processing token:', error);
-                  }
+              // Process each unique mint in the transaction
+              const processedMints = new Set<string>();
+              for (const balance of tx.meta.postTokenBalances) {
+                const mintAddress = balance.mint;
+                
+                if (processedMints.has(mintAddress) || results.has(mintAddress)) continue;
+                processedMints.add(mintAddress);
+
+                const tokenInfo = await getTokenInfoFromMint(mintAddress, tx.blockTime, 'recent_tx');
+                if (tokenInfo && matchesTokenQuery(searchQuery, tokenInfo.name, tokenInfo.symbol, mintAddress)) {
+                  results.set(mintAddress, tokenInfo);
                 }
               }
             } catch (error) {
@@ -254,17 +266,13 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
             }
           })
         );
-
-        // If we've found a lot of tokens, break early
-        if (results.size >= 200) {
-          break;
-        }
       }
     } catch (error) {
       console.error('Error searching tokens:', error);
     }
 
-    // Sort tokens
+    // Sort and return results
+    console.log(`Found ${results.size} matching tokens`);
     const allTokens = Array.from(results.values());
     const sortedTokens = allTokens.sort((a, b) => {
       // Known tokens first
@@ -278,11 +286,10 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       return b.mintDate.getTime() - a.mintDate.getTime();
     });
 
-    // Return more results
-    return sortedTokens.slice(0, 100); // Increased limit to show more tokens
+    return sortedTokens.slice(0, 100);
 
   } catch (error) {
-    console.error('Error searching tokens:', error);
+    console.error('Error in searchTokens:', error);
     throw error;
   }
 }

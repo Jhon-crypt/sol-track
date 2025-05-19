@@ -1,4 +1,4 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 // Base interface for token data
@@ -8,6 +8,7 @@ interface BaseToken {
   symbol: string;
   mintDate?: Date;
   isNewToken?: boolean;
+  supply?: string;
 }
 
 // Main token info interface used throughout the app
@@ -46,6 +47,23 @@ async function retryWithBackoff<T>(
   }
 }
 
+// Helper function to check if a transaction contains a mint instruction
+function hasMintInstruction(tx: ParsedTransactionWithMeta | null): boolean {
+  if (!tx?.meta?.innerInstructions?.length) return false;
+  
+  for (const inner of tx.meta.innerInstructions) {
+    for (const ix of inner.instructions) {
+      if ('parsed' in ix && ix.parsed && 
+          typeof ix.parsed === 'object' && 
+          'type' in ix.parsed && 
+          (ix.parsed.type === 'initializeMint' || ix.parsed.type === 'mintTo')) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export async function searchTokens(query: string): Promise<TokenInfo[]> {
   try {
     const results = new Map<string, TokenInfo>();
@@ -71,7 +89,9 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
 
             if (signatures.length > 0) {
               const mintTx = await retryWithBackoff(() =>
-                connection.getTransaction(signatures[0].signature)
+                connection.getParsedTransaction(signatures[0].signature, {
+                  maxSupportedTransactionVersion: 0
+                })
               );
               
               const mintDate = mintTx?.blockTime ? new Date(mintTx.blockTime * 1000) : undefined;
@@ -84,7 +104,8 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 symbol: tokenData.symbol || 'Unknown',
                 source: 'on-chain',
                 mintDate,
-                isNewToken
+                isNewToken,
+                supply: tokenData.supply || '0'
               });
             }
           }
@@ -100,18 +121,18 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
       const recentSignatures = await retryWithBackoff(() =>
         connection.getSignaturesForAddress(
           new PublicKey(TOKEN_PROGRAM_ID),
-          { limit: 100 } // Reduced from 1000 to avoid rate limits
+          { limit: 200 } // Increased but still manageable
         )
       );
 
       // Process in smaller batches with delay between batches
-      const batchSize = 10; // Reduced batch size
+      const batchSize = 5; // Smaller batch size for more detailed processing
       for (let i = 0; i < recentSignatures.length; i += batchSize) {
         const batch = recentSignatures.slice(i, i + batchSize);
         
         // Add delay between batches
         if (i > 0) {
-          await delay(500);
+          await delay(1000); // Longer delay between batches
         }
 
         await Promise.all(
@@ -123,49 +144,53 @@ export async function searchTokens(query: string): Promise<TokenInfo[]> {
                 })
               );
               
-              if (!tx?.meta?.postTokenBalances?.length) return;
+              // Skip if not a mint transaction
+              if (!tx || !hasMintInstruction(tx)) return;
               
               // Look through post balances for new token mints
-              for (const balance of tx.meta.postTokenBalances) {
-                const mintAddress = balance.mint;
-                
-                // Skip if already found
-                if (results.has(mintAddress)) continue;
-                
-                const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
-                const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
-                
-                try {
-                  const tokenInfo = await retryWithBackoff(() =>
-                    connection.getParsedAccountInfo(new PublicKey(mintAddress))
-                  );
+              if (tx.meta?.postTokenBalances?.length) {
+                for (const balance of tx.meta.postTokenBalances) {
+                  const mintAddress = balance.mint;
                   
-                  if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
+                  // Skip if already found
+                  if (results.has(mintAddress)) continue;
                   
-                  const data = tokenInfo.value.data;
-                  if ('parsed' in data && data.parsed.type === 'mint') {
-                    const tokenData = data.parsed.info;
-                    const name = tokenData.name || 'Unknown';
-                    const symbol = tokenData.symbol || 'Unknown';
+                  const mintDate = tx.blockTime ? new Date(tx.blockTime * 1000) : undefined;
+                  const isNewToken = mintDate ? (currentTime.getTime() - mintDate.getTime() <= ONE_DAY) : true;
+                  
+                  try {
+                    const tokenInfo = await retryWithBackoff(() =>
+                      connection.getParsedAccountInfo(new PublicKey(mintAddress))
+                    );
+                    
+                    if (!tokenInfo.value?.data || typeof tokenInfo.value.data !== 'object') continue;
+                    
+                    const data = tokenInfo.value.data;
+                    if ('parsed' in data && data.parsed.type === 'mint') {
+                      const tokenData = data.parsed.info;
+                      const name = tokenData.name || 'Unknown';
+                      const symbol = tokenData.symbol || 'Unknown';
 
-                    // Check if matches search query
-                    if (!name.toLowerCase().includes(searchQuery) && 
-                        !symbol.toLowerCase().includes(searchQuery) &&
-                        !mintAddress.toLowerCase().includes(searchQuery)) {
-                      continue;
+                      // Check if matches search query
+                      if (!name.toLowerCase().includes(searchQuery) && 
+                          !symbol.toLowerCase().includes(searchQuery) &&
+                          !mintAddress.toLowerCase().includes(searchQuery)) {
+                        continue;
+                      }
+
+                      results.set(mintAddress, {
+                        address: mintAddress,
+                        name,
+                        symbol,
+                        source: 'on-chain',
+                        mintDate,
+                        isNewToken,
+                        supply: tokenData.supply || '0'
+                      });
                     }
-
-                    results.set(mintAddress, {
-                      address: mintAddress,
-                      name,
-                      symbol,
-                      source: 'on-chain',
-                      mintDate,
-                      isNewToken
-                    });
+                  } catch (error) {
+                    console.error('Error processing mint:', error);
                   }
-                } catch (error) {
-                  console.error('Error processing mint:', error);
                 }
               }
             } catch (error) {

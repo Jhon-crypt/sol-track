@@ -162,18 +162,18 @@ export default function Home() {
                         className="p-4 rounded-lg bg-[#1E293B] border border-green-800 hover:border-green-700 transition-colors duration-200"
                       >
                         <div className="flex items-start justify-between mb-3">
-                          <div>
-                            <h3 className="text-lg font-medium">{token.name}</h3>
-                            <p className="text-blue-400 font-mono">{token.symbol}</p>
+                          <div className="min-w-0 flex-1 mr-3">
+                            <h3 className="text-lg font-medium truncate">{token.name}</h3>
+                            <p className="text-blue-400 font-mono truncate">{token.symbol}</p>
                             {token.mintDate && (
-                              <p className="text-xs text-green-400 mt-1">
+                              <p className="text-xs text-green-400 mt-1 truncate">
                                 Minted: {new Date(token.mintDate).toLocaleDateString()} at{' '}
                                 {new Date(token.mintDate).toLocaleTimeString()}
                               </p>
                             )}
                           </div>
-                          <div className="flex flex-col items-end gap-2">
-                            <span className="px-2 py-1 text-xs rounded-full bg-green-900 text-green-300">
+                          <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                            <span className="px-2 py-1 text-xs rounded-full bg-green-900 text-green-300 whitespace-nowrap">
                               {token.source}
                             </span>
                           </div>
@@ -182,10 +182,11 @@ export default function Home() {
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
                             <span className="text-sm text-gray-400">Contract Address:</span>
-                            <div className="flex items-center space-x-2">
+                            <div className="flex items-center space-x-2 flex-shrink-0">
                               <button
                                 onClick={() => copyToClipboard(token.address)}
                                 className="group flex items-center space-x-1 text-gray-400 hover:text-white transition-colors duration-200"
+                                title="Copy address"
                               >
                                 {copiedAddress === token.address ? (
                                   <CheckCircleIcon className="h-5 w-5 text-green-500" />
@@ -198,14 +199,20 @@ export default function Home() {
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="text-gray-400 hover:text-white transition-colors duration-200"
+                                title="View on Solscan"
                               >
                                 <ArrowTopRightOnSquareIcon className="h-5 w-5" />
                               </a>
                             </div>
                           </div>
-                          <p className="font-mono text-sm text-gray-300 break-all">
-                            {token.address}
-                          </p>
+                          <div className="relative group">
+                            <p className="font-mono text-sm text-gray-300 truncate" title={token.address}>
+                              {token.address}
+                            </p>
+                            <div className="absolute left-0 right-0 -bottom-1 opacity-0 group-hover:opacity-100 transition-opacity bg-[#1E293B] p-2 rounded-md shadow-lg z-10 font-mono text-sm text-gray-300 break-all">
+                              {token.address}
+                            </div>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -226,22 +233,22 @@ export default function Home() {
                         className="p-4 rounded-lg bg-[#1E293B] border border-gray-800 hover:border-gray-700 transition-colors duration-200"
                       >
                         <div className="flex items-start justify-between mb-3">
-                          <div>
-                            <h3 className="text-lg font-medium">{token.name}</h3>
-                            <p className="text-blue-400 font-mono">{token.symbol}</p>
+                          <div className="min-w-0 flex-1 mr-3">
+                            <h3 className="text-lg font-medium truncate">{token.name}</h3>
+                            <p className="text-blue-400 font-mono truncate">{token.symbol}</p>
                             {token.mintDate && (
-                              <p className="text-xs text-green-400 mt-1">
+                              <p className="text-xs text-green-400 mt-1 truncate">
                                 Minted: {new Date(token.mintDate).toLocaleDateString()} at{' '}
                                 {new Date(token.mintDate).toLocaleTimeString()}
                               </p>
                             )}
                           </div>
-                          <div className="flex flex-col items-end gap-2">
-                            <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300">
+                          <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                            <span className="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-300 whitespace-nowrap">
                               {token.source}
                             </span>
                             {!token.mintDate && (
-                              <span className="text-xs text-gray-500">Mint date unknown</span>
+                              <span className="text-xs text-gray-500 whitespace-nowrap">Mint date unknown</span>
                             )}
                           </div>
                         </div>
@@ -249,10 +256,11 @@ export default function Home() {
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
                             <span className="text-sm text-gray-400">Contract Address:</span>
-                            <div className="flex items-center space-x-2">
+                            <div className="flex items-center space-x-2 flex-shrink-0">
                               <button
                                 onClick={() => copyToClipboard(token.address)}
                                 className="group flex items-center space-x-1 text-gray-400 hover:text-white transition-colors duration-200"
+                                title="Copy address"
                               >
                                 {copiedAddress === token.address ? (
                                   <CheckCircleIcon className="h-5 w-5 text-green-500" />
@@ -265,14 +273,20 @@ export default function Home() {
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="text-gray-400 hover:text-white transition-colors duration-200"
+                                title="View on Solscan"
                               >
                                 <ArrowTopRightOnSquareIcon className="h-5 w-5" />
                               </a>
                             </div>
                           </div>
-                          <p className="font-mono text-sm text-gray-300 break-all">
-                            {token.address}
-                          </p>
+                          <div className="relative group">
+                            <p className="font-mono text-sm text-gray-300 truncate" title={token.address}>
+                              {token.address}
+                            </p>
+                            <div className="absolute left-0 right-0 -bottom-1 opacity-0 group-hover:opacity-100 transition-opacity bg-[#1E293B] p-2 rounded-md shadow-lg z-10 font-mono text-sm text-gray-300 break-all">
+                              {token.address}
+                            </div>
+                          </div>
                         </div>
                       </div>
                     ))}
